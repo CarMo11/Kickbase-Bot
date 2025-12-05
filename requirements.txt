@@ -1,1 +1,2 @@
-kickbase-api
+git+https://github.com/kevinskyba/kickbase-api-python.git@master
+python-dotenv
