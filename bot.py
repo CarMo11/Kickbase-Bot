@@ -7,6 +7,8 @@ from kickbase_api.exceptions import KickbaseLoginException, KickbaseException
 from kickbase_api.models._transforms import parse_date
 from kickbase_api.models.user import User
 from kickbase_api.models.league_data import LeagueData
+from kickbase_api.models.league_me import LeagueMe
+from kickbase_api.models.market import Market
 
 
 # ============== KONFIG ==============
@@ -25,31 +27,24 @@ MIN_CASH_BUFFER = 500_000  # z.B. 500k
 MAX_OVERPAY_PCT = 0.10
 
 
-# ============== PATCHE: Kickbase v4 Login ==============
+# ============== PATCHE: Kickbase v4 Login + League/Market ==============
 
 class Kickbase(KickbaseBase):
     """
     Wrapper um die originale Kickbase-API-Library mit
-    aktualisierter Login-Methode für API v4.
+    aktualisierten Methoden für API v4.
     """
 
     def login(self, username: str, password: str):
         """
-        Verwendet den v4-Endpoint /v4/user/login.
-
-        Request-Body laut v4-Doku:
+        v4-Login: POST /v4/user/login
+        Body:
         {
           "em":   email,
           "loy":  false,
           "pass": password,
           "rep":  {}
         }
-
-        Response enthält u.a.:
-        - "tkn"   -> Access-Token
-        - "tknex" -> Ablaufdatum
-        - "u"     -> User-Objekt
-        - "srvl"  -> Ligen
         """
         data = {
             "em": username,
@@ -58,12 +53,10 @@ class Kickbase(KickbaseBase):
             "rep": {}
         }
 
-        # False = ohne Auth-Header (wir haben noch keinen Token)
         logging.info("Kickbase v4 Login wird ausgeführt ...")
         r = self._do_post("/v4/user/login", data, False)
         status = r.status_code
 
-        # Versuche JSON zu parsen (für Logging bei Fehlern)
         try:
             j = r.json()
         except Exception:
@@ -72,8 +65,8 @@ class Kickbase(KickbaseBase):
         logging.info("Login-Response Status: %s", status)
 
         if status == 200 and j is not None:
-            # Feldnamen laut v4-Doku
             try:
+                # Token ist in v4 "tkn" / "tknex"
                 self.token = j["tkn"]
                 self.token_expire = parse_date(j["tknex"])
                 self._username = username
@@ -96,6 +89,48 @@ class Kickbase(KickbaseBase):
         else:
             logging.error("Kickbase Login fehlgeschlagen. Status=%s", status)
             logging.error("Response Body: %s", j if j is not None else r.text)
+            raise KickbaseException()
+
+    def league_me(self, league):
+        """
+        v4-Variante von league_me:
+        GET /v4/leagues/{leagueId}/me
+        """
+        league_id = self._get_league_id(league)
+        logging.info("Hole league_me für Liga %s ...", league_id)
+        r = self._do_get(f"/v4/leagues/{league_id}/me", True)
+        status = r.status_code
+        logging.info("league_me Status: %s", status)
+        try:
+            j = r.json()
+        except Exception:
+            j = None
+
+        if status == 200 and j is not None:
+            return LeagueMe(j)
+        else:
+            logging.error("league_me fehlgeschlagen. Status=%s, Body=%s", status, j if j is not None else r.text)
+            raise KickbaseException()
+
+    def market(self, league):
+        """
+        v4-Variante vom Transfermarkt:
+        GET /v4/leagues/{leagueId}/market
+        """
+        league_id = self._get_league_id(league)
+        logging.info("Hole market für Liga %s ...", league_id)
+        r = self._do_get(f"/v4/leagues/{league_id}/market", True)
+        status = r.status_code
+        logging.info("market Status: %s", status)
+        try:
+            j = r.json()
+        except Exception:
+            j = None
+
+        if status == 200 and j is not None:
+            return Market(j)
+        else:
+            logging.error("market fehlgeschlagen. Status=%s, Body=%s", status, j if j is not None else r.text)
             raise KickbaseException()
 
 
@@ -216,12 +251,22 @@ def run_bot_once():
     logging.info("Nutze Liga: %s (ID=%s)", league.name, league.id)
 
     # Eigene Budget-/Teamdaten holen
-    me = kb.league_me(league)
-    budget = me.budget or 0
-    logging.info("Budget: %s | Teamwert: %s", budget, me.team_value)
+    try:
+        me = kb.league_me(league)
+    except KickbaseException:
+        logging.error("league_me fehlgeschlagen – Bot bricht ab.")
+        return
+
+    budget = getattr(me, "budget", 0) or 0
+    logging.info("Budget: %s | Teamwert: %s", budget, getattr(me, "team_value", None))
 
     # Transfermarkt holen
-    market = kb.market(league)
+    try:
+        market = kb.market(league)
+    except KickbaseException:
+        logging.error("market fehlgeschlagen – Bot bricht ab.")
+        return
+
     if getattr(market, "closed", False):
         logging.info("Transfermarkt ist aktuell geschlossen – nichts zu tun.")
         return
