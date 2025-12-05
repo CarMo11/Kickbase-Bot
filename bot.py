@@ -2,7 +2,11 @@ import os
 import logging
 from datetime import datetime, timezone
 
-from kickbase_api.kickbase import Kickbase  # kommt aus dem Paket "kickbase-api"
+from kickbase_api.kickbase import Kickbase as KickbaseBase
+from kickbase_api.exceptions import KickbaseLoginException, KickbaseException
+from kickbase_api.models._transforms import parse_date
+from kickbase_api.models.user import User
+from kickbase_api.models.league_data import LeagueData
 
 
 # ============== KONFIG ==============
@@ -19,6 +23,80 @@ MIN_CASH_BUFFER = 500_000  # z.B. 500k
 
 # Maximaler Aufschlag auf Marktwert in Prozent (z.B. 10%)
 MAX_OVERPAY_PCT = 0.10
+
+
+# ============== PATCHE: Kickbase v4 Login ==============
+
+class Kickbase(KickbaseBase):
+    """
+    Wrapper um die originale Kickbase-API-Library mit
+    aktualisierter Login-Methode für API v4.
+    """
+
+    def login(self, username: str, password: str):
+        """
+        Verwendet den v4-Endpoint /v4/user/login.
+
+        Request-Body laut v4-Doku:
+        {
+          "em":   email,
+          "loy":  false,
+          "pass": password,
+          "rep":  {}
+        }
+
+        Response enthält u.a.:
+        - "tkn"   -> Access-Token
+        - "tknex" -> Ablaufdatum
+        - "u"     -> User-Objekt
+        - "srvl"  -> Ligen
+        """
+        data = {
+            "em": username,
+            "loy": False,
+            "pass": password,
+            "rep": {}
+        }
+
+        # False = ohne Auth-Header (wir haben noch keinen Token)
+        logging.info("Kickbase v4 Login wird ausgeführt ...")
+        r = self._do_post("/v4/user/login", data, False)
+        status = r.status_code
+
+        # Versuche JSON zu parsen (für Logging bei Fehlern)
+        try:
+            j = r.json()
+        except Exception:
+            j = None
+
+        logging.info("Login-Response Status: %s", status)
+
+        if status == 200 and j is not None:
+            # Feldnamen laut v4-Doku
+            try:
+                self.token = j["tkn"]
+                self.token_expire = parse_date(j["tknex"])
+                self._username = username
+                self._password = password
+
+                user = User(j["u"])
+                league_data = [LeagueData(d) for d in j["srvl"]]
+                logging.info("Login erfolgreich als %s", getattr(user, "name", user))
+                return user, league_data
+            except KeyError as e:
+                logging.error("Login-Response hat unerwartete Struktur, fehlender Key: %s", e)
+                logging.error("Response JSON: %s", j)
+                raise KickbaseException()
+
+        elif status == 401:
+            logging.error("Kickbase Login 401 (Unauthorized) – bitte Email/Passwort prüfen.")
+            logging.error("Response Body: %s", j if j is not None else r.text)
+            raise KickbaseLoginException()
+
+        else:
+            logging.error("Kickbase Login fehlgeschlagen. Status=%s", status)
+            logging.error("Response Body: %s", j if j is not None else r.text)
+            raise KickbaseException()
 
 
 # ============== HELFER ==============
@@ -60,7 +138,7 @@ def decide_bid_simple(player, me_budget: int) -> int | None:
     - wenn Trend <= 0: nur MW (Fangnetz)
     - Budget- und Sicherheitsgrenzen werden beachtet
     """
-    mv = player.market_value or 0
+    mv = getattr(player, "market_value", 0) or 0
     trend = getattr(player, "market_value_trend", 0) or 0
 
     if mv <= 0:
@@ -114,7 +192,15 @@ def run_bot_once():
     kb = Kickbase()
 
     # Login
-    user, leagues = kb.login(email, password)
+    try:
+        user, leagues = kb.login(email, password)
+    except KickbaseLoginException:
+        logging.error("Login fehlgeschlagen: falsche Zugangsdaten oder Konto nicht für API-Login geeignet.")
+        return
+    except KickbaseException:
+        logging.error("Login fehlgeschlagen: allgemeiner API-Fehler.")
+        return
+
     logging.info("Eingeloggt als %s", getattr(user, "name", user))
 
     if not leagues:
@@ -157,8 +243,8 @@ def run_bot_once():
         if bid is None:
             continue
 
-        name = f"{p.first_name} {p.last_name}".strip()
-        mv = p.market_value
+        name = f"{getattr(p, 'first_name', '')} {getattr(p, 'last_name', '')}".strip()
+        mv = getattr(p, "market_value", 0)
         trend = getattr(p, "market_value_trend", 0) or 0
         mins_left = int(secs_left // 60)
 
