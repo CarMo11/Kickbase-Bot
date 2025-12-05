@@ -1,0 +1,31 @@
+name: Kickbase Bot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # alle 10 Minuten
+  workflow_dispatch: {}      # manuell startbar
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Kickbase bot
+        env:
+          KICKBASE_EMAIL: ${{ secrets.KICKBASE_EMAIL }}
+          KICKBASE_PASSWORD: ${{ secrets.KICKBASE_PASSWORD }}
+          KICKBASE_LEAGUE_ID: ${{ secrets.KICKBASE_LEAGUE_ID }}
+        run: |
+          python bot.py
