@@ -3,11 +3,17 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from kickbase_api.kickbase import Kickbase
+from kickbase_api.kickbase import Kickbase as KickbaseBase
 from kickbase_api.exceptions import KickbaseLoginException, KickbaseException
+from kickbase_api.models._transforms import parse_date
+from kickbase_api.models.user import User
+from kickbase_api.models.league_data import LeagueData
+from kickbase_api.models.league_me import LeagueMe
+from kickbase_api.models.market import Market
 
-
-# ============== KONFIG ==============
+# ============================================================
+# KONFIG
+# ============================================================
 
 # True = Bot loggt nur, was er bieten WÜRDE
 # False = Bot schickt wirklich Gebote an Kickbase
@@ -27,7 +33,165 @@ MAX_OVERPAY_PCT = 0.10
 MIN_DAILY_ROI = 0.03  # 0.03 = 3 %
 
 
-# ============== HELFER ==============
+# ============================================================
+# PATCH: Kickbase v4 Wrapper
+# ============================================================
+
+
+class Kickbase(KickbaseBase):
+    """
+    Wrapper um die originale Kickbase-API-Library:
+
+    - Login über /v4/user/login
+    - league_me über /v4/leagues/{leagueId}/me
+    - market über /v4/leagues/{leagueId}/market
+
+    Hintergrund: Die Library ist auf ältere Endpoints ausgelegt und wirft
+    sonst beim Login/Market oft nur KickbaseException().
+    """
+
+    def login(self, username: str, password: str):
+        """
+        Führt einen Login gegen /v4/user/login aus.
+
+        Erfolgreich:
+        - setzt self.token, self.token_expire, self.user
+        - gibt (user, leagues) zurück wie die Original-Library
+
+        Fehler:
+        - wirft KickbaseLoginException bei 401
+        - wirft KickbaseException bei allen anderen Fehlern
+        """
+        logging.info("Versuche Kickbase Login über /v4/user/login ...")
+
+        data = {
+            "em": username,
+            "loy": False,
+            "pass": password,
+            "rep": {},
+        }
+
+        resp = self._do_post("/v4/user/login", data, False)
+        status = resp.status_code
+
+        try:
+            j = resp.json()
+        except Exception:
+            body = resp.text
+            logging.error(
+                "Login-Antwort ist kein gültiges JSON. Status=%s, body[0:300]=%s",
+                status,
+                body[:300],
+            )
+            raise KickbaseException()
+
+        logging.info("Login-HTTP-Status: %s", status)
+
+        if status == 200:
+            try:
+                self.token = j["tkn"]
+                self.token_expire = parse_date(j["tknex"])
+                self.user = User(j["u"])
+                leagues = [LeagueData(d) for d in j.get("srvl", [])]
+            except KeyError as e:
+                logging.error(
+                    "Login-JSON-Struktur unerwartet, Key fehlt: %s, body=%s",
+                    e,
+                    j,
+                )
+                raise KickbaseException()
+
+            logging.info(
+                "Login erfolgreich. Eingeloggt als: %s",
+                getattr(self.user, "name", None),
+            )
+            return self.user, leagues
+
+        elif status == 401:
+            logging.error(
+                "Kickbase Login 401 Unauthorized – "
+                "E-Mail/Passwort falsch oder Account gesperrt."
+            )
+            raise KickbaseLoginException()
+
+        else:
+            logging.error(
+                "Kickbase Login fehlgeschlagen. Status=%s, body=%s",
+                status,
+                j,
+            )
+            raise KickbaseException()
+
+    def league_me(self, league) -> LeagueMe:
+        """
+        v4-Variante von league_me: GET /v4/leagues/{leagueId}/me
+        """
+        league_id = self._get_league_id(league)
+        logging.info("Hole league_me für Liga %s ...", league_id)
+
+        resp = self._do_get(f"/v4/leagues/{league_id}/me", True)
+        status = resp.status_code
+
+        try:
+            j = resp.json()
+        except Exception:
+            body = resp.text
+            logging.error(
+                "league_me-Antwort kein gültiges JSON. Status=%s, body[0:300]=%s",
+                status,
+                body[:300],
+            )
+            raise KickbaseException()
+
+        logging.info("league_me Status: %s", status)
+
+        if status == 200:
+            return LeagueMe(j)
+        else:
+            logging.error(
+                "league_me fehlgeschlagen. Status=%s, body=%s",
+                status,
+                j,
+            )
+            raise KickbaseException()
+
+    def market(self, league) -> Market:
+        """
+        v4-Variante vom Transfermarkt: GET /v4/leagues/{leagueId}/market
+        """
+        league_id = self._get_league_id(league)
+        logging.info("Hole market für Liga %s ...", league_id)
+
+        resp = self._do_get(f"/v4/leagues/{league_id}/market", True)
+        status = resp.status_code
+
+        try:
+            j = resp.json()
+        except Exception:
+            body = resp.text
+            logging.error(
+                "market-Antwort kein gültiges JSON. Status=%s, body[0:300]=%s",
+                status,
+                body[:300],
+            )
+            raise KickbaseException()
+
+        logging.info("market Status: %s", status)
+
+        if status == 200:
+            return Market(j)
+        else:
+            logging.error(
+                "market fehlgeschlagen. Status=%s, body=%s",
+                status,
+                j,
+            )
+            raise KickbaseException()
+
+
+# ============================================================
+# HELFER
+# ============================================================
 
 
 def get_env(name: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
@@ -54,7 +218,9 @@ def seconds_until_expiry(expiry_raw: int) -> float:
     return (exp - now).total_seconds()
 
 
-# ============== BID-LOGIK (v2 – Steiger + ROI) ==============
+# ============================================================
+# BID-LOGIK (Steiger + ROI)
+# ============================================================
 
 
 def decide_bid_smart(player, me_budget: int) -> Optional[int]:
@@ -118,7 +284,9 @@ def decide_bid_smart(player, me_budget: int) -> Optional[int]:
     return int(bid)
 
 
-# ============== HAUPTLAUF ==============
+# ============================================================
+# HAUPTLAUF
+# ============================================================
 
 
 def run_bot_once():
