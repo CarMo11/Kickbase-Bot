@@ -1,7 +1,7 @@
 import os
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List
 
 from kickbase_api.kickbase import Kickbase as KickbaseBase
 from kickbase_api.exceptions import KickbaseLoginException, KickbaseException
@@ -41,11 +41,10 @@ class Kickbase(KickbaseBase):
     Wrapper um die originale Kickbase-API-Library:
 
     - Login über /v4/user/login (weil Kickbase den alten Login geändert hat)
-    - ALLE anderen Endpoints (league_me, market, make_offer, ...) kommen
-      aus der Original-Library und benutzen deren Models.
+    - ALLE anderen Endpoints nutzen wir hier manuell über _do_get/_do_post.
 
-    Hintergrund: Unser erster Versuch, league_me/market selbst zu parsen,
-    hat das JSON nicht korrekt in die Models gemappt → Budget=0, players=[].
+    Die alten Models (LeagueMe, Market, ...) passen nicht mehr sauber auf
+    die v4-JSONs und haben bei dir Budget=0 / players=[] geliefert.
     """
 
     def login(self, username: str, password: str):
@@ -120,6 +119,62 @@ class Kickbase(KickbaseBase):
             )
             raise KickbaseException()
 
+    # ---- v4-JSON direkt holen ---------------------------------
+
+    def get_league_me_json(self, league_id: str) -> Dict[str, Any]:
+        """
+        /v4/leagues/{leagueId}/me → Roh-JSON zurückgeben.
+        """
+        logging.info("Hole league_me JSON für Liga %s ...", league_id)
+        resp = self._do_get(f"/v4/leagues/{league_id}/me", True)
+        status = resp.status_code
+        try:
+            j = resp.json()
+        except Exception:
+            body = resp.text
+            logging.error(
+                "league_me-Antwort kein gültiges JSON. Status=%s, body[0:300]=%s",
+                status,
+                body[:300],
+            )
+            raise KickbaseException()
+
+        logging.info("league_me Status: %s", status)
+        logging.info("league_me raw JSON: %s", j)
+
+        if status != 200:
+            logging.error("league_me fehlgeschlagen. body=%s", j)
+            raise KickbaseException()
+
+        return j
+
+    def get_market_json(self, league_id: str) -> Dict[str, Any]:
+        """
+        /v4/leagues/{leagueId}/market → Roh-JSON zurückgeben.
+        """
+        logging.info("Hole market JSON für Liga %s ...", league_id)
+        resp = self._do_get(f"/v4/leagues/{league_id}/market", True)
+        status = resp.status_code
+        try:
+            j = resp.json()
+        except Exception:
+            body = resp.text
+            logging.error(
+                "market-Antwort kein gültiges JSON. Status=%s, body[0:300]=%s",
+                status,
+                body[:300],
+            )
+            raise KickbaseException()
+
+        logging.info("market Status: %s", status)
+        logging.info("market raw JSON: %s", j)
+
+        if status != 200:
+            logging.error("market fehlgeschlagen. body=%s", j)
+            raise KickbaseException()
+
+        return j
+
 
 # ============================================================
 # HELFER
@@ -133,44 +188,42 @@ def get_env(name: str, required: bool = True, default: Optional[str] = None) -> 
     return value
 
 
-def expiry_to_datetime(expiry_raw: int) -> datetime:
+def expiry_to_datetime_from_exs(exs: int) -> datetime:
     """
-    Kickbase liefert expiry als Unix-Timestamp.
-    Je nach Implementierung sind das Sekunden oder Millisekunden.
+    exs = "seconds until expiry" aus dem market-JSON.
+    Wir rechnen das auf eine absolute Zeit um, damit Sorting/Logging hübsch ist.
     """
-    if expiry_raw > 10**12:  # Millisekunden
-        return datetime.fromtimestamp(expiry_raw / 1000, tz=timezone.utc)
-    else:  # Sekunden
-        return datetime.fromtimestamp(expiry_raw, tz=timezone.utc)
-
-
-def seconds_until_expiry(expiry_raw: int) -> float:
     now = datetime.now(timezone.utc)
-    exp = expiry_to_datetime(expiry_raw)
-    return (exp - now).total_seconds()
+    return now + timedelta(seconds=exs)
+
+
+def seconds_until_expiry_from_exs(exs: int) -> float:
+    """
+    exs kommt direkt von Kickbase als "Restsekunden bis Auktionsende".
+    """
+    return float(exs)
 
 
 # ============================================================
-# BID-LOGIK (Steiger + ROI)
+# BID-LOGIK (Steiger + ROI) – arbeitet auf dicts aus dem JSON
 # ============================================================
 
 
-def decide_bid_smart(player, me_budget: int) -> Optional[int]:
+def decide_bid_smart(player: Dict[str, Any], me_budget: int) -> Optional[int]:
     """
-    Smartere Auto-Bid-Variante:
+    Smartere Auto-Bid-Variante, direkt auf dem JSON-Item:
 
-    - bietet NUR auf Steiger (market_value_trend > 0)
-    - bewertet die Steigerung relativ zum Marktwert (ROI)
-    - berücksichtigt Restlaufzeit (z.B. nur <= 60 Min)
-    - beachtet Budget-Buffer und max. Overpay
-
-    Aktuell basiert das auf der letzten Steigerung (market_value_trend).
-    Die "letzte 3 Updates"-Logik können wir später ergänzen, wenn wir
-    Marktwert-Historie in einer DB speichern.
+    Erwartete Felder im player-Dict:
+    - 'mv'  : Marktwert (int)
+    - 'mvt' : Marktwert-Trend (int, positiv = Steiger)
+    - 'exs' : Restsekunden bis Auktionsende (int)
+    - 'fn'  : Vorname
+    - 'n'   : Nachname
     """
 
-    mv = getattr(player, "market_value", 0) or 0
-    trend = getattr(player, "market_value_trend", 0) or 0
+    mv = int(player.get("mv") or 0)
+    trend = int(player.get("mvt") or 0)
+    secs_left = int(player.get("exs") or 0)
 
     if mv <= 0:
         return None
@@ -180,7 +233,6 @@ def decide_bid_smart(player, me_budget: int) -> Optional[int]:
         return None
 
     # Restlaufzeit des Angebots
-    secs_left = seconds_until_expiry(player.expiry)
     if secs_left < 0:
         return None
 
@@ -266,48 +318,55 @@ def run_bot_once():
     else:
         league = leagues[0]
 
-    logging.info("Nutze Liga: %s (ID=%s)", league.name, league.id)
+    league_id_str = str(league.id)
+    logging.info("Nutze Liga: %s (ID=%s)", league.name, league_id_str)
 
-    # Eigene Budget-/Teamdaten holen (Original-Library)
+    # ========================================================
+    # League-Me JSON holen und Budget extrahieren
+    # ========================================================
+
     try:
-        me = kb.league_me(league)
+        me_json = kb.get_league_me_json(league_id_str)
     except KickbaseException:
-        logging.error("league_me fehlgeschlagen – Bot bricht ab.")
+        logging.error("league_me (JSON) fehlgeschlagen – Bot bricht ab.")
         return
 
-    # Fallback: manche Versionen nennen das Feld evtl. anders
-    budget = (
-        getattr(me, "budget", None)
-        or getattr(me, "money", None)
-        or 0
-    )
-    team_value = getattr(me, "team_value", None) or getattr(me, "teamworth", None)
-
-    logging.info("Budget: %s | Teamwert: %s", budget, team_value)
-
-    # Transfermarkt holen (Original-Library)
+    # In deinen Logs war 'b': 50000000.0 → Budget im JSON
+    raw_budget = me_json.get("b", 0)
     try:
-        market = kb.market(league)
+        budget = int(raw_budget)
+    except (TypeError, ValueError):
+        budget = 0
+
+    logging.info("Budget (aus JSON 'b'): %s", budget)
+
+    # ========================================================
+    # Markt-JSON holen und Spieler extrahieren
+    # ========================================================
+
+    try:
+        market_json = kb.get_market_json(league_id_str)
     except KickbaseException:
-        logging.error("market fehlgeschlagen – Bot bricht ab.")
+        logging.error("market (JSON) fehlgeschlagen – Bot bricht ab.")
         return
 
-    if getattr(market, "closed", False):
-        logging.info("Transfermarkt ist aktuell geschlossen – nichts zu tun.")
-        return
+    # In deinen Logs: market raw JSON: {'it': [ {...}, {...}, ... ], ...}
+    items: List[Dict[str, Any]] = market_json.get("it", []) or []
+    logging.info("Spieler auf dem Markt (JSON 'it'): %d", len(items))
 
-    players = market.players or []
-    logging.info("Spieler auf dem Markt: %d", len(players))
-
-    if not players:
+    if not items:
         logging.info("Keine Spieler auf dem Markt.")
         return
 
     # Spieler nach Ablaufzeit sortieren (bald ablaufende zuerst)
-    players_sorted = sorted(players, key=lambda p: expiry_to_datetime(p.expiry))
+    def sort_key(p: Dict[str, Any]) -> datetime:
+        exs = int(p.get("exs") or 0)
+        return expiry_to_datetime_from_exs(exs)
+
+    players_sorted = sorted(items, key=sort_key)
 
     for p in players_sorted:
-        secs_left = seconds_until_expiry(p.expiry)
+        secs_left = seconds_until_expiry_from_exs(int(p.get("exs") or 0))
 
         # Grober Filter: nur Spieler im globalen Fenster
         if secs_left < 0 or secs_left > MAX_EXPIRY_WINDOW_SECONDS:
@@ -318,9 +377,9 @@ def run_bot_once():
         if bid is None:
             continue
 
-        name = f"{getattr(p, 'first_name', '')} {getattr(p, 'last_name', '')}".strip()
-        mv = getattr(p, "market_value", 0)
-        trend = getattr(p, "market_value_trend", 0) or 0
+        name = f"{p.get('fn', '')} {p.get('n', '')}".strip()
+        mv = int(p.get("mv") or 0)
+        trend = int(p.get("mvt") or 0)
         mins_left = int(secs_left // 60)
 
         logging.info(
@@ -335,10 +394,11 @@ def run_bot_once():
         if DRY_RUN:
             logging.info("DRY_RUN aktiv – Gebot wird NICHT gesendet.")
         else:
-            logging.info("Sende Gebot %s für %s ...", bid, name)
-            kb.make_offer(bid, p, league)
-            # lokales Budget anpassen, damit wir im gleichen Run nicht zu viel verballern
-            budget -= bid
+            # TODO: echten Biet-Endpoint anbinden (/v4/leagues/{leagueId}/market/...)
+            logging.info(
+                "EIGENTLICH würde ich jetzt ein Gebot senden, "
+                "aber make_offer ist noch nicht implementiert."
+            )
 
     logging.info("Bot-Durchlauf fertig.")
 
