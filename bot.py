@@ -8,8 +8,6 @@ from kickbase_api.exceptions import KickbaseLoginException, KickbaseException
 from kickbase_api.models._transforms import parse_date
 from kickbase_api.models.user import User
 from kickbase_api.models.league_data import LeagueData
-from kickbase_api.models.league_me import LeagueMe
-from kickbase_api.models.market import Market
 
 # ============================================================
 # KONFIG
@@ -34,7 +32,7 @@ MIN_DAILY_ROI = 0.03  # 0.03 = 3 %
 
 
 # ============================================================
-# PATCH: Kickbase v4 Wrapper
+# PATCH: Kickbase v4 Wrapper – NUR LOGIN
 # ============================================================
 
 
@@ -42,12 +40,12 @@ class Kickbase(KickbaseBase):
     """
     Wrapper um die originale Kickbase-API-Library:
 
-    - Login über /v4/user/login
-    - league_me über /v4/leagues/{leagueId}/me
-    - market über /v4/leagues/{leagueId}/market
+    - Login über /v4/user/login (weil Kickbase den alten Login geändert hat)
+    - ALLE anderen Endpoints (league_me, market, make_offer, ...) kommen
+      aus der Original-Library und benutzen deren Models.
 
-    Hintergrund: Die Library ist auf ältere Endpoints ausgelegt und wirft
-    sonst beim Login/Market oft nur KickbaseException().
+    Hintergrund: Unser erster Versuch, league_me/market selbst zu parsen,
+    hat das JSON nicht korrekt in die Models gemappt → Budget=0, players=[].
     """
 
     def login(self, username: str, password: str):
@@ -117,97 +115,6 @@ class Kickbase(KickbaseBase):
         else:
             logging.error(
                 "Kickbase Login fehlgeschlagen. Status=%s, body=%s",
-                status,
-                j,
-            )
-            raise KickbaseException()
-
-    def league_me(self, league) -> LeagueMe:
-        """
-        v4-Variante von league_me: GET /v4/leagues/{leagueId}/me
-        + Debug-Logs, damit wir sehen, wie das JSON heute aussieht.
-        """
-        league_id = self._get_league_id(league)
-        logging.info("Hole league_me für Liga %s ...", league_id)
-
-        resp = self._do_get(f"/v4/leagues/{league_id}/me", True)
-        status = resp.status_code
-
-        try:
-            j = resp.json()
-        except Exception:
-            body = resp.text
-            logging.error(
-                "league_me-Antwort kein gültiges JSON. Status=%s, body[0:300]=%s",
-                status,
-                body[:300],
-            )
-            raise KickbaseException()
-
-        logging.info("league_me Status: %s", status)
-        logging.info("league_me raw JSON: %s", j)
-
-        if status == 200:
-            me_obj = LeagueMe(j)
-            logging.info(
-                "Parsed LeagueMe: budget=%s | team_value=%s | attrs=%s",
-                getattr(me_obj, "budget", None),
-                getattr(me_obj, "team_value", None),
-                me_obj.__dict__,
-            )
-            return me_obj
-        else:
-            logging.error(
-                "league_me fehlgeschlagen. Status=%s, body=%s",
-                status,
-                j,
-            )
-            raise KickbaseException()
-
-    def market(self, league) -> Market:
-        """
-        v4-Variante vom Transfermarkt: GET /v4/leagues/{leagueId}/market
-        + Debug-Logs, damit wir sehen, was die API wirklich liefert.
-        """
-        league_id = self._get_league_id(league)
-        logging.info("Hole market für Liga %s ...", league_id)
-
-        resp = self._do_get(f"/v4/leagues/{league_id}/market", True)
-        status = resp.status_code
-
-        try:
-            j = resp.json()
-        except Exception:
-            body = resp.text
-            logging.error(
-                "market-Antwort kein gültiges JSON. Status=%s, body[0:300]=%s",
-                status,
-                body[:300],
-            )
-            raise KickbaseException()
-
-        logging.info("market Status: %s", status)
-        logging.info("market raw JSON: %s", j)
-
-        if status == 200:
-            m = Market(j)
-            players = getattr(m, "players", []) or []
-            logging.info(
-                "Parsed Market: closed=%s | players_count=%d",
-                getattr(m, "closed", None),
-                len(players),
-            )
-            # zur Sicherheit ersten Spieler einmal loggen
-            if players:
-                p0 = players[0]
-                logging.info(
-                    "Erster Market-Player: %s",
-                    getattr(p0, "__dict__", p0),
-                )
-            return m
-        else:
-            logging.error(
-                "market fehlgeschlagen. Status=%s, body=%s",
                 status,
                 j,
             )
@@ -361,17 +268,24 @@ def run_bot_once():
 
     logging.info("Nutze Liga: %s (ID=%s)", league.name, league.id)
 
-    # Eigene Budget-/Teamdaten holen
+    # Eigene Budget-/Teamdaten holen (Original-Library)
     try:
         me = kb.league_me(league)
     except KickbaseException:
         logging.error("league_me fehlgeschlagen – Bot bricht ab.")
         return
 
-    budget = getattr(me, "budget", 0) or 0
-    logging.info("Budget: %s | Teamwert: %s", budget, getattr(me, "team_value", None))
+    # Fallback: manche Versionen nennen das Feld evtl. anders
+    budget = (
+        getattr(me, "budget", None)
+        or getattr(me, "money", None)
+        or 0
+    )
+    team_value = getattr(me, "team_value", None) or getattr(me, "teamworth", None)
 
-    # Transfermarkt holen
+    logging.info("Budget: %s | Teamwert: %s", budget, team_value)
+
+    # Transfermarkt holen (Original-Library)
     try:
         market = kb.market(league)
     except KickbaseException:
@@ -383,6 +297,8 @@ def run_bot_once():
         return
 
     players = market.players or []
+    logging.info("Spieler auf dem Markt: %d", len(players))
+
     if not players:
         logging.info("Keine Spieler auf dem Markt.")
         return
