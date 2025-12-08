@@ -18,7 +18,8 @@ from kickbase_api.models.league_data import LeagueData
 DRY_RUN = True
 
 # Nur Spieler betrachten, deren Auktion in diesem Zeitfenster endet (Sekunden)
-MAX_EXPIRY_WINDOW_SECONDS = 2 * 60 * 60  # 2 Stunden
+# Für den Anfang weit: 24 Stunden
+MAX_EXPIRY_WINDOW_SECONDS = 24 * 60 * 60  # 24 Stunden
 
 # Mindestens so viel Geld soll nach einem Gebot noch übrig bleiben
 MIN_CASH_BUFFER = 500_000  # z.B. 500k
@@ -26,9 +27,9 @@ MIN_CASH_BUFFER = 500_000  # z.B. 500k
 # Maximaler Aufschlag auf Marktwert in Prozent (z.B. 10%)
 MAX_OVERPAY_PCT = 0.10
 
-# minimale "tägliche" Steigerung relativ zum Marktwert, z.B. 3 %
-# (für deinen Steiger-/ROI-Filter)
-MIN_DAILY_ROI = 0.03  # 0.03 = 3 %
+# minimale "tägliche" Steigerung relativ zum Marktwert
+# Fürs Debugging erstmal 0.0 = jeder Steiger (trend > 0) ist okay
+MIN_DAILY_ROI = 0.0  # 0.0 = kein Mindest-ROI
 
 
 # ============================================================
@@ -223,21 +224,12 @@ def decide_bid_smart(player: Dict[str, Any], me_budget: int) -> Optional[int]:
 
     mv = int(player.get("mv") or 0)
     trend = int(player.get("mvt") or 0)
-    secs_left = int(player.get("exs") or 0)
 
     if mv <= 0:
         return None
 
     # Nicht alles Geld rausballern
     if me_budget <= MIN_CASH_BUFFER:
-        return None
-
-    # Restlaufzeit des Angebots
-    if secs_left < 0:
-        return None
-
-    # engeres Zeitfenster: z.B. 60 Minuten statt 2 Stunden
-    if secs_left > 60 * 60:
         return None
 
     # Nur Steiger
@@ -247,7 +239,7 @@ def decide_bid_smart(player: Dict[str, Any], me_budget: int) -> Optional[int]:
     # ROI = Steigerung im Verhältnis zum Marktwert
     roi = trend / mv  # z.B. 0.05 = 5 %
 
-    # Mindest-ROI (billige, stark steigende Spieler bevorzugen)
+    # Mindest-ROI (für Debugging aktuell 0.0 → jeder Steiger erlaubt)
     if roi < MIN_DAILY_ROI:
         return None
 
