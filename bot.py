@@ -14,7 +14,7 @@ from kickbase_api.models.league_data import LeagueData
 # ============================================================
 
 # True = Bot loggt nur, was er bieten WÜRDE
-# False = Bot schickt wirklich Gebote an Kickbase
+# False = Bot schickt wirklich Gebote an Kickbase (noch nicht aktiviert)
 DRY_RUN = True
 
 # Nur Spieler betrachten, deren Auktion in diesem Zeitfenster endet (Sekunden)
@@ -44,7 +44,7 @@ class Kickbase(KickbaseBase):
     - ALLE anderen Endpoints nutzen wir hier manuell über _do_get/_do_post.
 
     Die alten Models (LeagueMe, Market, ...) passen nicht mehr sauber auf
-    die v4-JSONs und haben bei dir Budget=0 / players=[] geliefert.
+    die v4-JSONs und haben Budget=0 / players=[] geliefert.
     """
 
     def login(self, username: str, password: str):
@@ -331,7 +331,7 @@ def run_bot_once():
         logging.error("league_me (JSON) fehlgeschlagen – Bot bricht ab.")
         return
 
-    # In deinen Logs war 'b': 50000000.0 → Budget im JSON
+    # In deinen v4-JSON-Logs war 'b': <Budget>
     raw_budget = me_json.get("b", 0)
     try:
         budget = int(raw_budget)
@@ -350,7 +350,7 @@ def run_bot_once():
         logging.error("market (JSON) fehlgeschlagen – Bot bricht ab.")
         return
 
-    # In deinen Logs: market raw JSON: {'it': [ {...}, {...}, ... ], ...}
+    # In den v4-JSONs steckt der Markt unter 'it': [ {...}, {...}, ... ]
     items: List[Dict[str, Any]] = market_json.get("it", []) or []
     logging.info("Spieler auf dem Markt (JSON 'it'): %d", len(items))
 
@@ -394,10 +394,9 @@ def run_bot_once():
         if DRY_RUN:
             logging.info("DRY_RUN aktiv – Gebot wird NICHT gesendet.")
         else:
-            # TODO: echten Biet-Endpoint anbinden (/v4/leagues/{leagueId}/market/...)
             logging.info(
                 "EIGENTLICH würde ich jetzt ein Gebot senden, "
-                "aber make_offer ist noch nicht implementiert."
+                "aber make_offer_v4 ist noch nicht eingebaut."
             )
 
     logging.info("Bot-Durchlauf fertig.")
