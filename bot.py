@@ -1,6 +1,5 @@
 import os
 import logging
-from datetime import datetime, timezone
 from typing import Optional
 
 from kickbase_api.kickbase import Kickbase as KickbaseBase
@@ -8,7 +7,6 @@ from kickbase_api.exceptions import KickbaseLoginException, KickbaseException
 from kickbase_api.models._transforms import parse_date
 from kickbase_api.models.user import User
 from kickbase_api.models.league_data import LeagueData
-from kickbase_api.models.market import Market
 
 
 # ============================================================
@@ -20,7 +18,8 @@ from kickbase_api.models.market import Market
 DRY_RUN = False
 
 # Nur Spieler betrachten, deren Auktion in diesem Zeitfenster endet (Sekunden)
-MAX_EXPIRY_WINDOW_SECONDS = 2 * 60 * 60  # 2 Stunden
+# 24h, damit deine aktuellen Markt-Spieler mit ~2–12h Restlaufzeit mitgenommen werden
+MAX_EXPIRY_WINDOW_SECONDS = 24 * 60 * 60  # 24 Stunden
 
 # Mindestens so viel Geld soll nach einem Gebot noch übrig bleiben
 MIN_CASH_BUFFER = 500_000  # z.B. 500k
@@ -40,7 +39,7 @@ class Kickbase(KickbaseBase):
 
     - Login über /v4/user/login
     - league_me über /v4/leagues/{leagueId}/me
-    - market über /v4/leagues/{leagueId}/market
+    - market über /v4/leagues/{leagueId}/market (wir nutzen das rohe JSON!)
     - Gebote über /v4/leagues/{leagueId}/market/{playerId}/offer
     """
 
@@ -158,10 +157,13 @@ class Kickbase(KickbaseBase):
             )
             raise KickbaseException()
 
-    def market(self, league) -> Market:
+    def market(self, league) -> dict:
         """
-        v4-Variante vom Transfermarkt: GET /v4/leagues/{leagueId}/market
-        Wir loggen das rohe JSON und parsen es dann mit dem Market-Modell.
+        v4 Transfermarkt: GET /v4/leagues/{leagueId}/market
+
+        WICHTIG:
+        - Wir geben das **rohe JSON** zurück.
+        - Spieler stehen im Feld 'it' (Liste von dicts).
         """
         league_id = self._get_league_id(league)
         logging.info("Hole market JSON für Liga %s ...", league_id)
@@ -184,18 +186,9 @@ class Kickbase(KickbaseBase):
         logging.info("market raw JSON: %s", j)
 
         if status == 200:
-            # Nur für Info:
             items = j.get("it", []) or []
             logging.info("Spieler auf dem Markt (JSON 'it'): %d", len(items))
-
-            # Library-Modell benutzen (lief in den Logs bereits ohne Fehler)
-            m = Market(j)
-            players = getattr(m, "players", []) or []
-            logging.info(
-                "Market-Objekt: players_count=%d",
-                len(players),
-            )
-            return m
+            return j
         else:
             logging.error(
                 "market fehlgeschlagen. Status=%s, body=%s",
@@ -212,7 +205,7 @@ class Kickbase(KickbaseBase):
         Body: { "prc": <Gebot> }
 
         Gibt bei Erfolg das JSON der API zurück, wirft sonst KickbaseException
-        und loggt Status + Body, damit wir Fehleranalyse machen können.
+        und loggt Status + Body.
         """
         league_id = self._get_league_id(league)
         price = int(price)
@@ -265,58 +258,40 @@ def get_env(name: str, required: bool = True, default: Optional[str] = None) -> 
     return value
 
 
-def expiry_to_datetime(expiry_raw: int) -> datetime:
-    """
-    Kickbase liefert expiry über das Model (vermutlich aus 'exs').
-    Wir behandeln expiry_raw als Unix-Timestamp (Sekunden oder Millisekunden).
-    """
-    if expiry_raw > 10**12:  # Millisekunden
-        return datetime.fromtimestamp(expiry_raw / 1000, tz=timezone.utc)
-    else:  # Sekunden
-        return datetime.fromtimestamp(expiry_raw, tz=timezone.utc)
-
-
-def seconds_until_expiry(expiry_raw: int) -> float:
-    now = datetime.now(timezone.utc)
-    exp = expiry_to_datetime(expiry_raw)
-    return (exp - now).total_seconds()
-
-
 # ============================================================
-# BID-LOGIK (einfache Steiger-Logik)
+# BID-LOGIK (auf Basis des rohen JSON-Items)
 # ============================================================
 
 
-def decide_bid_smart(player, me_budget: int) -> Optional[int]:
+def decide_bid_smart(item: dict, me_budget: int) -> Optional[int]:
     """
-    Einfache Auto-Bid-Variante:
+    Einfache Auto-Bid-Variante auf Basis der rohen Markt-Items (JSON):
 
-    - bietet NUR auf Steiger (mvt / market_value_trend > 0)
-    - berücksichtigt Restlaufzeit (MAX_EXPIRY_WINDOW_SECONDS)
-    - beachtet Budget-Buffer und max. Overpay
+    Felder im Item:
+      - mv  = Marktwert
+      - mvt = Trend-Flag (0 = fällt/neutral, >0 = Steiger)
+      - exs = Restlaufzeit in Sekunden
 
-    Aktuell: bietet ungefähr Marktwert + 1 (bzw. +TrendFlag),
-    gecappt auf MAX_OVERPAY_PCT über Marktwert.
+    Regeln:
+      - bietet NUR auf Steiger (mvt > 0)
+      - berücksichtigt Restlaufzeit (MAX_EXPIRY_WINDOW_SECONDS)
+      - beachtet Budget-Buffer (MIN_CASH_BUFFER)
+      - max. X % über Marktwert (MAX_OVERPAY_PCT)
     """
 
-    mv = getattr(player, "market_value", 0) or 0
-    # Trend-Flag: 0 = fällt, 1/2/... = steigt
-    trend_flag = getattr(player, "market_value_trend", None)
-    if trend_flag is None:
-        trend_flag = getattr(player, "mvt", 0) or 0
+    mv = int(item.get("mv", 0) or 0)
+    trend_flag = int(item.get("mvt", 0) or 0)
+    secs_left = int(item.get("exs", 0) or 0)
 
     if mv <= 0:
         return None
 
-    # Nicht alles Geld rausballern
     if me_budget <= MIN_CASH_BUFFER:
         return None
 
-    # Restlaufzeit des Angebots
-    secs_left = seconds_until_expiry(player.expiry)
+    # Restlaufzeit prüfen
     if secs_left < 0:
         return None
-
     if secs_left > MAX_EXPIRY_WINDOW_SECONDS:
         return None
 
@@ -325,7 +300,7 @@ def decide_bid_smart(player, me_budget: int) -> Optional[int]:
         return None
 
     # Ein kleines bisschen über Marktwert, orientiert am TrendFlag
-    increment = max(1, int(trend_flag))
+    increment = max(1, trend_flag)
     bid = mv + increment
 
     # Sicherheits-Cap: max. X % über Marktwert
@@ -409,38 +384,35 @@ def run_bot_once():
 
     logging.info("Budget: %s", budget)
 
-    # Transfermarkt holen
+    # Transfermarkt holen (ROHES JSON)
     try:
-        market = kb.market(league)
+        market_json = kb.market(league)
     except KickbaseException:
         logging.error("market fehlgeschlagen – Bot bricht ab.")
         return
 
-    players = getattr(market, "players", []) or []
-    if not players:
-        logging.info("Keine Spieler auf dem Markt.")
+    items = market_json.get("it", []) or []
+    if not items:
+        logging.info("Keine Spieler auf dem Markt (it-Liste leer).")
         return
 
-    # Spieler nach Ablaufzeit sortieren (bald ablaufende zuerst)
-    players_sorted = sorted(players, key=lambda p: expiry_to_datetime(p.expiry))
+    # Spieler nach Restlaufzeit sortieren (bald ablaufende zuerst)
+    items_sorted = sorted(items, key=lambda x: int(x.get("exs", 10**9) or 10**9))
 
-    for p in players_sorted:
-        secs_left = seconds_until_expiry(p.expiry)
+    for item in items_sorted:
+        secs_left = int(item.get("exs", 0) or 0)
+        mv = int(item.get("mv", 0) or 0)
+        trend_flag = int(item.get("mvt", 0) or 0)
+        mins_left = secs_left // 60
 
-        # Grober Filter: nur Spieler im globalen Fenster
-        if secs_left < 0 or secs_left > MAX_EXPIRY_WINDOW_SECONDS:
-            continue
-
-        bid = decide_bid_smart(p, budget)
+        # Bid-Entscheidung
+        bid = decide_bid_smart(item, budget)
         if bid is None:
             continue
 
-        name = f"{getattr(p, 'first_name', '')} {getattr(p, 'last_name', '')}".strip()
-        mv = getattr(p, "market_value", 0)
-        trend_flag = getattr(p, "market_value_trend", None)
-        if trend_flag is None:
-            trend_flag = getattr(p, "mvt", 0) or 0
-        mins_left = int(secs_left // 60)
+        fn = item.get("fn", "") or ""
+        ln = item.get("n", "") or ""
+        name = f"{fn} {ln}".strip() or f"Player {item.get('i')}"
 
         logging.info(
             "Kandidat: %s | MW=%s | TrendFlag=%s | Rest=%d min | Gebot=%s",
@@ -451,8 +423,7 @@ def run_bot_once():
             bid,
         )
 
-        # Player-ID aus Model (je nach Library 'id' oder 'i')
-        player_id = getattr(p, "id", None) or getattr(p, "i", None)
+        player_id = str(item.get("i"))
         if not player_id:
             logging.error("Kein player_id für %s gefunden, überspringe.", name)
             continue
