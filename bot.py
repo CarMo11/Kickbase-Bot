@@ -15,7 +15,7 @@ from kickbase_api.models.league_data import LeagueData
 
 # True = Bot loggt nur, was er bieten WÜRDE
 # False = Bot schickt wirklich Gebote an Kickbase (noch nicht aktiviert)
-DRY_RUN = True
+DRY_RUN = False
 
 # Nur Spieler betrachten, deren Auktion in diesem Zeitfenster endet (Sekunden)
 # Für den Anfang weit: 24 Stunden
