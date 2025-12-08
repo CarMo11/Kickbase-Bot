@@ -1,3 +1,126 @@
+import os
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+from kickbase_api.kickbase import Kickbase
+from kickbase_api.exceptions import KickbaseLoginException, KickbaseException
+
+
+# ============== KONFIG ==============
+
+# True = Bot loggt nur, was er bieten WÜRDE
+# False = Bot schickt wirklich Gebote an Kickbase
+DRY_RUN = True
+
+# Nur Spieler betrachten, deren Auktion in diesem Zeitfenster endet (Sekunden)
+MAX_EXPIRY_WINDOW_SECONDS = 2 * 60 * 60  # 2 Stunden
+
+# Mindestens so viel Geld soll nach einem Gebot noch übrig bleiben
+MIN_CASH_BUFFER = 500_000  # z.B. 500k
+
+# Maximaler Aufschlag auf Marktwert in Prozent (z.B. 10%)
+MAX_OVERPAY_PCT = 0.10
+
+# minimale "tägliche" Steigerung relativ zum Marktwert, z.B. 3 %
+# (für deinen Steiger-/ROI-Filter)
+MIN_DAILY_ROI = 0.03  # 0.03 = 3 %
+
+
+# ============== HELFER ==============
+
+
+def get_env(name: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
+    value = os.environ.get(name, default)
+    if required and not value:
+        raise RuntimeError(f"Umgebungsvariable {name} ist nicht gesetzt.")
+    return value
+
+
+def expiry_to_datetime(expiry_raw: int) -> datetime:
+    """
+    Kickbase liefert expiry als Unix-Timestamp.
+    Je nach Implementierung sind das Sekunden oder Millisekunden.
+    """
+    if expiry_raw > 10**12:  # Millisekunden
+        return datetime.fromtimestamp(expiry_raw / 1000, tz=timezone.utc)
+    else:  # Sekunden
+        return datetime.fromtimestamp(expiry_raw, tz=timezone.utc)
+
+
+def seconds_until_expiry(expiry_raw: int) -> float:
+    now = datetime.now(timezone.utc)
+    exp = expiry_to_datetime(expiry_raw)
+    return (exp - now).total_seconds()
+
+
+# ============== BID-LOGIK (v2 – Steiger + ROI) ==============
+
+
+def decide_bid_smart(player, me_budget: int) -> Optional[int]:
+    """
+    Smartere Auto-Bid-Variante:
+
+    - bietet NUR auf Steiger (market_value_trend > 0)
+    - bewertet die Steigerung relativ zum Marktwert (ROI)
+    - berücksichtigt Restlaufzeit (z.B. nur <= 60 Min)
+    - beachtet Budget-Buffer und max. Overpay
+
+    Aktuell basiert das auf der letzten Steigerung (market_value_trend).
+    Die "letzte 3 Updates"-Logik können wir später ergänzen, wenn wir
+    Marktwert-Historie in einer DB speichern.
+    """
+
+    mv = getattr(player, "market_value", 0) or 0
+    trend = getattr(player, "market_value_trend", 0) or 0
+
+    if mv <= 0:
+        return None
+
+    # Nicht alles Geld rausballern
+    if me_budget <= MIN_CASH_BUFFER:
+        return None
+
+    # Restlaufzeit des Angebots
+    secs_left = seconds_until_expiry(player.expiry)
+    if secs_left < 0:
+        return None
+
+    # engeres Zeitfenster: z.B. 60 Minuten statt 2 Stunden
+    if secs_left > 60 * 60:
+        return None
+
+    # Nur Steiger
+    if trend <= 0:
+        return None
+
+    # ROI = Steigerung im Verhältnis zum Marktwert
+    roi = trend / mv  # z.B. 0.05 = 5 %
+
+    # Mindest-ROI (billige, stark steigende Spieler bevorzugen)
+    if roi < MIN_DAILY_ROI:
+        return None
+
+    # Du bist bereit, ungefähr eine weitere Steigerung vorzuzahlen
+    bid = mv + trend
+
+    # Sicherheits-Cap: max. X % über Marktwert
+    max_allowed = int(mv * (1 + MAX_OVERPAY_PCT))
+    bid = min(bid, max_allowed)
+
+    # Nie weniger als den aktuellen Marktwert bieten
+    bid = max(bid, mv)
+
+    # Budget-Check: nach dem Gebot soll noch MIN_CASH_BUFFER übrig sein
+    if me_budget - bid < MIN_CASH_BUFFER:
+        return None
+
+    return int(bid)
+
+
+# ============== HAUPTLAUF ==============
+
+
 def run_bot_once():
     logging.basicConfig(
         level=logging.INFO,
@@ -109,3 +232,7 @@ def run_bot_once():
             budget -= bid
 
     logging.info("Bot-Durchlauf fertig.")
+
+
+if __name__ == "__main__":
+    run_bot_once()
