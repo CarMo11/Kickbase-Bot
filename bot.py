@@ -1,12 +1,14 @@
 import os
 import logging
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
+from typing import Optional
 
 from kickbase_api.kickbase import Kickbase as KickbaseBase
 from kickbase_api.exceptions import KickbaseLoginException, KickbaseException
 from kickbase_api.models._transforms import parse_date
 from kickbase_api.models.user import User
 from kickbase_api.models.league_data import LeagueData
+from kickbase_api.models.market import Market
 
 
 # ============================================================
@@ -14,12 +16,11 @@ from kickbase_api.models.league_data import LeagueData
 # ============================================================
 
 # False = Bot schickt wirklich Gebote an Kickbase
-# True  = nur loggen, was er tun WÜRDE
+# True  = Bot loggt nur, was er bieten WÜRDE
 DRY_RUN = False
 
 # Nur Spieler betrachten, deren Auktion in diesem Zeitfenster endet (Sekunden)
-# (z.B. 24 Stunden)
-MAX_EXPIRY_WINDOW_SECONDS = 24 * 60 * 60
+MAX_EXPIRY_WINDOW_SECONDS = 2 * 60 * 60  # 2 Stunden
 
 # Mindestens so viel Geld soll nach einem Gebot noch übrig bleiben
 MIN_CASH_BUFFER = 500_000  # z.B. 500k
@@ -38,11 +39,9 @@ class Kickbase(KickbaseBase):
     Wrapper um die originale Kickbase-API-Library:
 
     - Login über /v4/user/login
-    - league_me_json über /v4/leagues/{leagueId}/me
-    - market_json über /v4/leagues/{leagueId}/market
-
-    Gebote werden weiterhin über die vorhandene make_offer()-Methode
-    der Library geschickt (alter Endpoint ohne /v4).
+    - league_me über /v4/leagues/{leagueId}/me
+    - market über /v4/leagues/{leagueId}/market
+    - Gebote über /v4/leagues/{leagueId}/market/{playerId}/offer
     """
 
     def login(self, username: str, password: str):
@@ -117,12 +116,11 @@ class Kickbase(KickbaseBase):
             )
             raise KickbaseException()
 
-    # --------- v4 league_me als rohes JSON ---------
-
-    def league_me_json(self, league) -> Dict[str, Any]:
+    def league_me(self, league) -> dict:
         """
         v4-Variante von league_me: GET /v4/leagues/{leagueId}/me
-        Gibt das rohe JSON zurück.
+
+        Gibt das rohe JSON als dict zurück. Budget steckt im Feld 'b'.
         """
         league_id = self._get_league_id(league)
         logging.info("Hole league_me JSON für Liga %s ...", league_id)
@@ -145,6 +143,12 @@ class Kickbase(KickbaseBase):
         logging.info("league_me raw JSON: %s", j)
 
         if status == 200:
+            budget_raw = j.get("b", 0)
+            try:
+                budget_val = int(budget_raw)
+            except (TypeError, ValueError):
+                budget_val = 0
+            logging.info("Budget (aus JSON 'b'): %s", budget_val)
             return j
         else:
             logging.error(
@@ -154,12 +158,10 @@ class Kickbase(KickbaseBase):
             )
             raise KickbaseException()
 
-    # --------- v4 market als rohes JSON ---------
-
-    def market_json(self, league) -> Dict[str, Any]:
+    def market(self, league) -> Market:
         """
         v4-Variante vom Transfermarkt: GET /v4/leagues/{leagueId}/market
-        Gibt das rohe JSON zurück.
+        Wir loggen das rohe JSON und parsen es dann mit dem Market-Modell.
         """
         league_id = self._get_league_id(league)
         logging.info("Hole market JSON für Liga %s ...", league_id)
@@ -182,7 +184,18 @@ class Kickbase(KickbaseBase):
         logging.info("market raw JSON: %s", j)
 
         if status == 200:
-            return j
+            # Nur für Info:
+            items = j.get("it", []) or []
+            logging.info("Spieler auf dem Markt (JSON 'it'): %d", len(items))
+
+            # Library-Modell benutzen (lief in den Logs bereits ohne Fehler)
+            m = Market(j)
+            players = getattr(m, "players", []) or []
+            logging.info(
+                "Market-Objekt: players_count=%d",
+                len(players),
+            )
+            return m
         else:
             logging.error(
                 "market fehlgeschlagen. Status=%s, body=%s",
@@ -190,6 +203,54 @@ class Kickbase(KickbaseBase):
                 j,
             )
             raise KickbaseException()
+
+    def make_offer_v4(self, league, player_id: str, price: int):
+        """
+        Versucht, ein Gebot über den v4-Endpoint zu platzieren:
+
+        POST /v4/leagues/{leagueId}/market/{playerId}/offer
+        Body: { "prc": <Gebot> }
+
+        Gibt bei Erfolg das JSON der API zurück, wirft sonst KickbaseException
+        und loggt Status + Body, damit wir Fehleranalyse machen können.
+        """
+        league_id = self._get_league_id(league)
+        price = int(price)
+
+        logging.info(
+            "make_offer_v4: league_id=%s, player_id=%s, price=%s",
+            league_id, player_id, price,
+        )
+
+        payload = {"prc": price}
+
+        resp = self._do_post(
+            f"/v4/leagues/{league_id}/market/{player_id}/offer",
+            payload,
+            True,  # mit Auth
+        )
+        status = resp.status_code
+        text = resp.text
+
+        try:
+            j = resp.json()
+        except Exception:
+            j = None
+
+        if status in (200, 201):
+            logging.info(
+                "Gebot erfolgreich gesendet! Status=%s, body=%s",
+                status,
+                j if j is not None else text[:300],
+            )
+            return j
+
+        logging.error(
+            "make_offer_v4 fehlgeschlagen: Status=%s, body=%s",
+            status,
+            j if j is not None else text[:300],
+        )
+        raise KickbaseException(f"make_offer_v4 failed with status {status}")
 
 
 # ============================================================
@@ -204,38 +265,45 @@ def get_env(name: str, required: bool = True, default: Optional[str] = None) -> 
     return value
 
 
-def seconds_until_expiry_from_item(item: Dict[str, Any]) -> int:
+def expiry_to_datetime(expiry_raw: int) -> datetime:
     """
-    Im v4-Market-JSON ist 'exs' = Sekunden bis Auktionsende.
+    Kickbase liefert expiry über das Model (vermutlich aus 'exs').
+    Wir behandeln expiry_raw als Unix-Timestamp (Sekunden oder Millisekunden).
     """
-    return int(item.get("exs", 0) or 0)
+    if expiry_raw > 10**12:  # Millisekunden
+        return datetime.fromtimestamp(expiry_raw / 1000, tz=timezone.utc)
+    else:  # Sekunden
+        return datetime.fromtimestamp(expiry_raw, tz=timezone.utc)
+
+
+def seconds_until_expiry(expiry_raw: int) -> float:
+    now = datetime.now(timezone.utc)
+    exp = expiry_to_datetime(expiry_raw)
+    return (exp - now).total_seconds()
 
 
 # ============================================================
-# BID-LOGIK (sehr simpel, auf v4 JSON angepasst)
+# BID-LOGIK (einfache Steiger-Logik)
 # ============================================================
 
 
-def decide_bid_smart(item: Dict[str, Any], me_budget: int) -> Optional[int]:
+def decide_bid_smart(player, me_budget: int) -> Optional[int]:
     """
-    Entscheidung, ob und wie hoch geboten wird.
+    Einfache Auto-Bid-Variante:
 
-    Wir nutzen die v4-Market-Felder:
-    - mv  = Marktwert
-    - mvt = Trend-Flag (0=stabil, 1/2=steigend, 3/4=fallend etc.)
-    - exs = Sekunden bis Auktionsende
+    - bietet NUR auf Steiger (mvt / market_value_trend > 0)
+    - berücksichtigt Restlaufzeit (MAX_EXPIRY_WINDOW_SECONDS)
+    - beachtet Budget-Buffer und max. Overpay
 
-    Heuristik:
-    - nur auf Spieler mit steigendem Trend (mvt > 0)
-    - nur innerhalb des globalen Zeitfensters (MAX_EXPIRY_WINDOW_SECONDS)
-    - Overpay-Cap bei MAX_OVERPAY_PCT
-    - Budgetpuffer MIN_CASH_BUFFER
-    - Gebot ist nur minimal über Marktwert: mv + mvt
+    Aktuell: bietet ungefähr Marktwert + 1 (bzw. +TrendFlag),
+    gecappt auf MAX_OVERPAY_PCT über Marktwert.
     """
 
-    mv = int(item.get("mv", 0) or 0)
-    trend_flag = int(item.get("mvt", 0) or 0)
-    secs_left = seconds_until_expiry_from_item(item)
+    mv = getattr(player, "market_value", 0) or 0
+    # Trend-Flag: 0 = fällt, 1/2/... = steigt
+    trend_flag = getattr(player, "market_value_trend", None)
+    if trend_flag is None:
+        trend_flag = getattr(player, "mvt", 0) or 0
 
     if mv <= 0:
         return None
@@ -244,23 +312,30 @@ def decide_bid_smart(item: Dict[str, Any], me_budget: int) -> Optional[int]:
     if me_budget <= MIN_CASH_BUFFER:
         return None
 
-    # Restlaufzeit (globaler Rahmen)
-    if secs_left < 0 or secs_left > MAX_EXPIRY_WINDOW_SECONDS:
+    # Restlaufzeit des Angebots
+    secs_left = seconds_until_expiry(player.expiry)
+    if secs_left < 0:
         return None
 
-    # nur „Steiger“
+    if secs_left > MAX_EXPIRY_WINDOW_SECONDS:
+        return None
+
+    # Nur Steiger
     if trend_flag <= 0:
         return None
 
-    # Basisgebot: minimal über Marktwert
-    bid = mv + trend_flag
+    # Ein kleines bisschen über Marktwert, orientiert am TrendFlag
+    increment = max(1, int(trend_flag))
+    bid = mv + increment
 
-    # Hard-Cap: nicht mehr als MAX_OVERPAY_PCT über Marktwert
+    # Sicherheits-Cap: max. X % über Marktwert
     max_allowed = int(mv * (1 + MAX_OVERPAY_PCT))
-    if bid > max_allowed:
-        bid = max_allowed
+    bid = min(bid, max_allowed)
 
-    # Budget-Check mit Puffer
+    # Nie weniger als den aktuellen Marktwert bieten
+    bid = max(bid, mv)
+
+    # Budget-Check: nach dem Gebot soll noch MIN_CASH_BUFFER übrig sein
     if me_budget - bid < MIN_CASH_BUFFER:
         return None
 
@@ -280,15 +355,13 @@ def run_bot_once():
 
     email = get_env("KICKBASE_EMAIL")
     password = get_env("KICKBASE_PASSWORD")
-    league_id_pref = os.environ.get("KICKBASE_LEAGUE_ID")  # deine Test-Liga
+    league_id_pref = os.environ.get("KICKBASE_LEAGUE_ID")
 
     logging.info("Starte Kickbase-Bot (DRY_RUN=%s)...", DRY_RUN)
 
     kb = Kickbase()
 
-    # ------------------------------------
     # Login
-    # ------------------------------------
     try:
         user, leagues = kb.login(email, password)
     except KickbaseLoginException:
@@ -306,11 +379,11 @@ def run_bot_once():
         logging.error("Keine Liga gefunden – Bot bricht ab.")
         return
 
-    # Alle Ligen loggen
+    # Alle Ligen einmal loggen, damit du die IDs siehst
     for l in leagues:
         logging.info("Liga gefunden: %s (ID=%s)", l.name, l.id)
 
-    # Liga wählen (ENV oder erste)
+    # Liga wählen (entweder gewünschte ID aus ENV oder erste Liga)
     if league_id_pref:
         league = next(
             (l for l in leagues if str(l.id) == str(league_id_pref)),
@@ -321,64 +394,53 @@ def run_bot_once():
 
     logging.info("Nutze Liga: %s (ID=%s)", league.name, league.id)
 
-    # ------------------------------------
-    # Eigene Budget-/Teamdaten (v4 JSON)
-    # ------------------------------------
+    # Eigene Budget-/Teamdaten holen
     try:
-        me_json = kb.league_me_json(league)
+        me_json = kb.league_me(league)
     except KickbaseException:
         logging.error("league_me fehlgeschlagen – Bot bricht ab.")
         return
 
-    budget_raw = me_json.get("b", 0)  # 'b' = Budget
+    budget_raw = me_json.get("b", 0)
     try:
-        budget = int(budget_raw or 0)
+        budget = int(budget_raw)
     except (TypeError, ValueError):
         budget = 0
 
-    logging.info("Budget (aus JSON 'b'): %s", budget)
+    logging.info("Budget: %s", budget)
 
-    # ------------------------------------
-    # Transfermarkt (v4 JSON)
-    # ------------------------------------
+    # Transfermarkt holen
     try:
-        market_json = kb.market_json(league)
+        market = kb.market(league)
     except KickbaseException:
         logging.error("market fehlgeschlagen – Bot bricht ab.")
         return
 
-    items: List[Dict[str, Any]] = market_json.get("it", []) or []
-    logging.info("Spieler auf dem Markt (JSON 'it'): %d", len(items))
-
-    if not items:
-        logging.info("Keine Spieler auf dem Markt – nichts zu tun.")
+    players = getattr(market, "players", []) or []
+    if not players:
+        logging.info("Keine Spieler auf dem Markt.")
         return
 
-    # Spieler nach Restlaufzeit sortieren (kleinste exs zuerst)
-    items_sorted = sorted(items, key=lambda it: seconds_until_expiry_from_item(it))
+    # Spieler nach Ablaufzeit sortieren (bald ablaufende zuerst)
+    players_sorted = sorted(players, key=lambda p: expiry_to_datetime(p.expiry))
 
-    # ------------------------------------
-    # Biet-Loop
-    # ------------------------------------
-    for it in items_sorted:
-        secs_left = seconds_until_expiry_from_item(it)
+    for p in players_sorted:
+        secs_left = seconds_until_expiry(p.expiry)
 
-        # globaler Rahmen (zusätzliche Sicherung)
+        # Grober Filter: nur Spieler im globalen Fenster
         if secs_left < 0 or secs_left > MAX_EXPIRY_WINDOW_SECONDS:
             continue
 
-        bid = decide_bid_smart(it, budget)
+        bid = decide_bid_smart(p, budget)
         if bid is None:
             continue
 
-        first_name = (it.get("fn") or "").strip()
-        last_name = (it.get("n") or "").strip()
-        name = (first_name + " " + last_name).strip() or it.get("n", "Unbekannt")
-
-        mv = int(it.get("mv", 0) or 0)
-        trend_flag = int(it.get("mvt", 0) or 0)
+        name = f"{getattr(p, 'first_name', '')} {getattr(p, 'last_name', '')}".strip()
+        mv = getattr(p, "market_value", 0)
+        trend_flag = getattr(p, "market_value_trend", None)
+        if trend_flag is None:
+            trend_flag = getattr(p, "mvt", 0) or 0
         mins_left = int(secs_left // 60)
-        player_id = it.get("i")
 
         logging.info(
             "Kandidat: %s | MW=%s | TrendFlag=%s | Rest=%d min | Gebot=%s",
@@ -389,18 +451,15 @@ def run_bot_once():
             bid,
         )
 
+        # Player-ID aus Model (je nach Library 'id' oder 'i')
+        player_id = getattr(p, "id", None) or getattr(p, "i", None)
+        if not player_id:
+            logging.error("Kein player_id für %s gefunden, überspringe.", name)
+            continue
+
         if DRY_RUN:
             logging.info("DRY_RUN aktiv – Gebot wird NICHT gesendet.")
-            continue
-
-        if not player_id:
-            logging.warning("Kein player_id im JSON – überspringe %s", name)
-            continue
-
-        # ------------------------------------
-        # Hier wird WIRKLICH geboten
-        # ------------------------------------
-        try:
+        else:
             logging.info(
                 "Sende Gebot %s für %s (player_id=%s, Liga=%s)...",
                 bid,
@@ -408,21 +467,18 @@ def run_bot_once():
                 player_id,
                 league.id,
             )
-            offer = kb.make_offer(bid, player_id, league)
-            logging.info(
-                "Gebot gesendet. Server-Antwort (Offer-Objekt): %s",
-                getattr(offer, "__dict__", offer),
-            )
-            # Lokales Budget reduzieren, damit im selben Run nicht OVERSPENT wird
-            budget -= bid
-        except KickbaseException as e:
-            logging.error(
-                "make_offer fehlgeschlagen für %s (player_id=%s): %s",
-                name,
-                player_id,
-                e,
-            )
-            # bei Fehler Budget nicht anpassen und weiter zum nächsten Spieler
+            try:
+                kb.make_offer_v4(league, player_id, bid)
+                # Lokales Budget anpassen, damit im gleichen Run
+                # nicht mehrfach dasselbe Geld verplant wird
+                budget -= bid
+            except KickbaseException as e:
+                logging.error(
+                    "make_offer fehlgeschlagen für %s (player_id=%s): %s",
+                    name,
+                    player_id,
+                    e,
+                )
 
     logging.info("Bot-Durchlauf fertig.")
 
