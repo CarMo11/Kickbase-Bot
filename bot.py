@@ -1,284 +1,324 @@
+#!/usr/bin/env python3
 import os
 import logging
-from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import requests
 from dotenv import load_dotenv
 
-# --------------------------------------------------------
-# Logging
-# --------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-
-log = logging.getLogger("kickbase-bot")
-
-
-# --------------------------------------------------------
-# Config
-# --------------------------------------------------------
-load_dotenv()
-
-EMAIL = os.getenv("KICKBASE_EMAIL")
-PASSWORD = os.getenv("KICKBASE_PASSWORD")
-LEAGUE_ID = os.getenv("KICKBASE_LEAGUE_ID")
-
-# DRY_RUN=True  -> nur Log-Ausgabe, keine echten Gebote
-# DRY_RUN=False -> echte Gebote
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+# ---------------------------------------------------------------------------
+# Konfiguration
+# ---------------------------------------------------------------------------
 
 BASE_URL = "https://api.kickbase.com"
 
+LOGIN_URL = f"{BASE_URL}/v4/user/login"
+LEAGUE_ME_URL_TEMPLATE = BASE_URL + "/v4/league/{league_id}/me"
+MARKET_URL_TEMPLATE = BASE_URL + "/v4/market/league/{league_id}"
 
-# --------------------------------------------------------
-# HTTP / Login
-# --------------------------------------------------------
-def login_v4(session: requests.Session, email: str, password: str) -> str:
-    """
-    Loggt sich über die v4-Login-Route ein und gibt das Token zurück.
-    Setzt außerdem den Authorization-Header im Session-Objekt.
-    """
-    url = f"{BASE_URL}/v4/user/login"
-    payload = {"email": email, "password": password}
+# ⚠️ Offer-Endpoint: dieser Pfad ist der wahrscheinlich richtige.
+# Falls du weiterhin 404 bekommst, muss GENAU diese URL an den echten
+# Kickbase-Endpunkt angepasst werden (der Rest des Bots ist davon unabhängig).
+OFFER_URL_TEMPLATE = BASE_URL + "/v4/market/league/{league_id}/player/{player_id}/offer"
 
-    log.info("Versuche Kickbase Login über %s ...", url)
-    r = session.post(url, json=payload)
-    log.info("Login-HTTP-Status: %s", r.status_code)
+BASE_HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "User-Agent": "KickbaseBot/0.1 (+github.com/CarMo11/Kickbase-Bot)",
+}
+
+# Wie stark überbieten wir den Marktwert?
+BID_OFFSET = 2
+
+# Nur Spieler mit positivem Trend mvt in dieser Liste werden berücksichtigt
+ALLOWED_TREND_FLAGS = {1, 2}
+
+
+# ---------------------------------------------------------------------------
+# Hilfsfunktionen
+# ---------------------------------------------------------------------------
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+
+def getenv_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+# ---------------------------------------------------------------------------
+# Kickbase HTTP-Funktionen (v4)
+# ---------------------------------------------------------------------------
+
+def login_v4(session: requests.Session, email: str, password: str) -> None:
+    """
+    Führt den Kickbase-Login über /v4/user/login aus und setzt das Auth-Token
+    im Session-Header.
+    """
+    logging.info("Versuche Kickbase Login über /v4/user/login ...")
+
+    session.headers.clear()
+    session.headers.update(BASE_HEADERS)
+
+    payload = {
+        "email": email,
+        "password": password,
+    }
+
+    r = session.post(LOGIN_URL, json=payload, timeout=15)
+    logging.info("Login-HTTP-Status: %s", r.status_code)
 
     if r.status_code != 200:
+        # Kickbase schickt z.B. {"err":1,"errMsg":"AccessDenied","svcs":[]}
         raise RuntimeError(f"Login fehlgeschlagen (Status {r.status_code}): {r.text}")
 
-    data = r.json()
-    # Token-Feld robust auslesen (je nach API-Version)
-    token = data.get("token") or data.get("t")
+    # Auth-Token aus Header holen
+    token = r.headers.get("x-auth-token")
     if not token:
-        raise RuntimeError("Login erfolgreich, aber kein Token im Response gefunden")
+        raise RuntimeError("Login erfolgreich, aber kein 'x-auth-token' im Header gefunden.")
 
-    user = data.get("user") or data.get("u") or {}
-    username = user.get("n") or user.get("name") or "Unbekannt"
+    session.headers["x-auth-token"] = token
 
-    # Authorization-Header für weitere Requests
-    session.headers.update({"authorization": f"Basic {token}"})
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
 
-    log.info("Login erfolgreich. Eingeloggt als: %s", username)
-    log.info("Eingeloggt als %s", username)
-    return token
+    username = data.get("un") or data.get("username") or "Unbekannt"
+    logging.info("Login erfolgreich. Eingeloggt als: %s", username)
 
 
 def get_league_me(session: requests.Session, league_id: str) -> Dict[str, Any]:
-    url = f"{BASE_URL}/v4/leagues/{league_id}/me"
-    log.info("Hole league_me JSON für Liga %s ...", league_id)
-    r = session.get(url)
-    log.info("league_me Status: %s", r.status_code)
+    url = LEAGUE_ME_URL_TEMPLATE.format(league_id=league_id)
+    logging.info("Hole league_me JSON für Liga %s ...", league_id)
+
+    r = session.get(url, timeout=15)
+    logging.info("league_me Status: %s", r.status_code)
     r.raise_for_status()
+
     data = r.json()
-    log.info("league_me raw JSON: %s", data)
+    logging.info("league_me raw JSON: %s", data)
     return data
 
 
 def get_market(session: requests.Session, league_id: str) -> Dict[str, Any]:
-    url = f"{BASE_URL}/v4/leagues/{league_id}/market"
-    log.info("Hole market JSON für Liga %s ...", league_id)
-    r = session.get(url)
-    log.info("market Status: %s", r.status_code)
+    url = MARKET_URL_TEMPLATE.format(league_id=league_id)
+    logging.info("Hole market JSON für Liga %s ...", league_id)
+
+    r = session.get(url, timeout=15)
+    logging.info("market Status: %s", r.status_code)
     r.raise_for_status()
+
     data = r.json()
-    log.info("market raw JSON: %s", data)
+    logging.info("market raw JSON: %s", data)
     return data
 
 
-# --------------------------------------------------------
-# Offer / Gebot senden
-# --------------------------------------------------------
-def try_send_offer(
-    session: requests.Session, league_id: str, player_id: str, price: int
-) -> bool:
-    """
-    Versucht, ein Gebot über mehrere mögliche Endpoints/Methoden zu senden.
-    Gibt True zurück, wenn irgendein Versuch Erfolg hatte.
-    """
-
-    # Mögliche Pfade – da Kickbase hier wohl umgebaut hat, probieren wir ein paar Varianten.
-    candidate_paths = [
-        f"/v4/leagues/{league_id}/market/{player_id}/offer",
-        f"/v4/leagues/{league_id}/market/{player_id}/bid",
-        f"/leagues/{league_id}/market/{player_id}/offer",
-        f"/leagues/{league_id}/transfermarket/{player_id}/offer",
-    ]
-    methods = ("post", "put")
-
-    payload = {"price": price}
-
-    for path in candidate_paths:
-        url = BASE_URL + path
-        for method in methods:
-            log.info("make_offer: versuche %s %s mit price=%s", method.upper(), url, price)
-            req = getattr(session, method)
-            r = req(url, json=payload)
-
-            status = r.status_code
-            body = r.text
-            log.info("make_offer: Status=%s, Body=%s", status, body[:300])
-
-            if status in (200, 201, 204):
-                log.info("Gebot erfolgreich über %s %s gesendet.", method.upper(), url)
-                return True
-
-            # 4xx = Pfad/Methoden-Kombi passt wohl nicht -> nächste probieren
-            if 400 <= status < 500:
-                continue
-
-    return False
-
-
-def send_offer(
+def make_offer_v4(
     session: requests.Session,
     league_id: str,
     player_id: str,
-    player_name: str,
-    bid_price: int,
+    price: int,
 ) -> None:
-    if DRY_RUN:
-        log.info(
-            "[DRY_RUN] Würde Gebot %s für %s (player_id=%s, Liga=%s) senden.",
-            bid_price,
-            player_name,
-            player_id,
-            league_id,
-        )
-        return
+    """
+    Schickt ein Gebot an den (vermuteten) v4-Offer-Endpunkt.
 
-    log.info(
-        "Sende Gebot %s für %s (player_id=%s, Liga=%s)...",
-        bid_price,
-        player_name,
-        player_id,
+    Falls hier weiterhin 404 kommt, musst du nur diese Funktion anpassen:
+    - URL in OFFER_URL_TEMPLATE
+    - evtl. Payload-Format
+    """
+    url = OFFER_URL_TEMPLATE.format(league_id=league_id, player_id=player_id)
+    payload = {"price": price}
+
+    logging.info(
+        "make_offer_v4: league_id=%s, player_id=%s, price=%s",
         league_id,
+        player_id,
+        price,
     )
 
-    ok = try_send_offer(session, league_id, str(player_id), bid_price)
-    if not ok:
-        log.error(
-            "make_offer fehlgeschlagen für %s (player_id=%s) – keine der getesteten Routen hat funktioniert.",
-            player_name,
-            player_id,
+    r = session.post(url, json=payload, timeout=15)
+    if r.status_code != 200:
+        logging.error(
+            "make_offer_v4 fehlgeschlagen: Status=%s, body=%s",
+            r.status_code,
+            r.text,
         )
+        raise RuntimeError(f"make_offer_v4 failed with status {r.status_code}")
+    else:
+        logging.info("make_offer_v4 erfolgreich: Status=%s", r.status_code)
 
 
-# --------------------------------------------------------
-# Auswahl der Kandidaten
-# --------------------------------------------------------
-def select_candidates(
-    market_data: Dict[str, Any],
-    budget: int,
-    max_players: int = 5,
-) -> List[Dict[str, Any]]:
-    """
-    Wählt Markt-Spieler aus, für die wir bieten wollen.
-    Nutzt direkt das JSON (Feld 'it'), wie es im Log zu sehen ist.
-    """
-    items = market_data.get("it", [])
-    log.info("Spieler auf dem Markt (JSON 'it'): %s", len(items))
+# ---------------------------------------------------------------------------
+# Markt-Logik
+# ---------------------------------------------------------------------------
 
-    # einfache Filter-Parameter – kannst du nach Belieben anpassen
-    min_trend_flag = 1          # mvt >= 1 (steigende Tendenz)
-    min_rest_minutes = 120      # mind. 2 Stunden Restzeit
-    max_candidates = max_players
+def select_candidates(market_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = market_json.get("it", [])
+    logging.info("Spieler auf dem Markt (JSON 'it'): %d", len(items))
 
     candidates: List[Dict[str, Any]] = []
 
     for item in items:
-        player_id = item.get("i")
-        first_name = item.get("fn", "") or ""
-        last_name = item.get("n", "") or ""
-        name = (first_name + " " + last_name).strip()
+        try:
+            player_id = str(item.get("i"))
+            first_name = (item.get("fn") or "").strip()
+            last_name = (item.get("n") or "").strip()
+            name = (first_name + " " + last_name).strip() or f"Player {player_id}"
 
-        mv = int(item.get("mv", 0))          # Marktwert
-        trend_flag = int(item.get("mvt", 0)) # 0,1,2...
-        exs = int(item.get("exs", 0))        # Restzeit in Sekunden
+            mv = int(item.get("mv", 0))  # Marktwert
+            mvt = int(item.get("mvt", 0))  # Trendflag
+            exs = int(item.get("exs", 0))  # Sekunden / sonstiger Counter
+            rest_min = exs // 60
 
-        rest_minutes = exs // 60
+            if mvt not in ALLOWED_TREND_FLAGS:
+                # Nur positive Trends
+                continue
 
-        # einfacher Filter
-        if trend_flag < min_trend_flag:
-            continue
-        if rest_minutes < min_rest_minutes:
-            continue
-        if mv <= 0 or mv > budget:
-            continue
+            # Gebot = Marktwert + Offset
+            bid_price = mv + BID_OFFSET if mv > 0 else int(item.get("prc", 0)) + BID_OFFSET
 
-        # Beispiel-Gebot: Marktwert + 1
-        bid_price = mv + 1
+            candidates.append(
+                {
+                    "player_id": player_id,
+                    "name": name,
+                    "mv": mv,
+                    "mvt": mvt,
+                    "rest_min": rest_min,
+                    "bid_price": bid_price,
+                }
+            )
+        except Exception as e:
+            logging.error("Fehler beim Verarbeiten eines Markt-Eintrags: %s", e)
 
-        log.info(
-            "Kandidat: %s | MW=%s | TrendFlag=%s | Rest=%s min | Gebot=%s",
-            name,
-            mv,
-            trend_flag,
-            rest_minutes,
-            bid_price,
-        )
-
-        candidates.append(
-            {
-                "player_id": player_id,
-                "name": name,
-                "mv": mv,
-                "trend_flag": trend_flag,
-                "rest_minutes": rest_minutes,
-                "bid_price": bid_price,
-            }
-        )
-
-        if len(candidates) >= max_candidates:
-            break
-
+    # Optional: Sortieren – z.B. nach Trendflag und Marktwert
+    candidates.sort(key=lambda c: (-c["mvt"], -c["mv"]))
     return candidates
 
 
-# --------------------------------------------------------
-# Main
-# --------------------------------------------------------
-def main() -> None:
-    if not EMAIL or not PASSWORD or not LEAGUE_ID:
-        raise SystemExit(
-            "Bitte KICKBASE_EMAIL, KICKBASE_PASSWORD und KICKBASE_LEAGUE_ID in .env setzen!"
+def process_market(
+    session: requests.Session,
+    league_id: str,
+    budget: int,
+    dry_run: bool,
+) -> None:
+    market_json = get_market(session, league_id)
+
+    items = market_json.get("it", [])
+    logging.info("Spieler auf dem Markt (JSON 'it'): %d", len(items))
+
+    candidates = select_candidates(market_json)
+
+    if not candidates:
+        logging.info("Keine geeigneten Kandidaten (positiver Trend) gefunden.")
+        return
+
+    remaining_budget = budget
+    logging.info("Starte Auto-Bieten mit Budget: %d", remaining_budget)
+
+    for cand in candidates:
+        name = cand["name"]
+        mv = cand["mv"]
+        mvt = cand["mvt"]
+        rest_min = cand["rest_min"]
+        bid_price = cand["bid_price"]
+        player_id = cand["player_id"]
+
+        logging.info(
+            "Kandidat: %s | MW=%d | TrendFlag=%d | Rest=%d min | Gebot=%d",
+            name,
+            mv,
+            mvt,
+            rest_min,
+            bid_price,
         )
 
-    log.info("Starte Kickbase-Bot (DRY_RUN=%s)...", DRY_RUN)
+        if bid_price > remaining_budget:
+            logging.info(
+                "Überspringe %s – Gebot %d > verbleibendes Budget %d",
+                name,
+                bid_price,
+                remaining_budget,
+            )
+            continue
+
+        if dry_run:
+            logging.info(
+                "[DRY_RUN] Würde Gebot %d für %s (player_id=%s, Liga=%s) senden.",
+                bid_price,
+                name,
+                player_id,
+                league_id,
+            )
+            remaining_budget -= bid_price  # Für Simulation Budget abziehen
+            continue
+
+        try:
+            logging.info(
+                "Sende Gebot %d für %s (player_id=%s, Liga=%s)...",
+                bid_price,
+                name,
+                player_id,
+                league_id,
+            )
+            make_offer_v4(session, league_id, player_id, bid_price)
+            remaining_budget -= bid_price
+        except Exception as e:
+            logging.error(
+                "make_offer fehlgeschlagen für %s (player_id=%s): %s",
+                name,
+                player_id,
+                e,
+            )
+
+    logging.info("Bot-Durchlauf fertig. Verbleibendes Budget (theoretisch): %d", remaining_budget)
+
+
+# ---------------------------------------------------------------------------
+# main()
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    setup_logging()
+
+    load_dotenv()  # Lokal praktisch, in GitHub Actions egal
+
+    email = os.getenv("KICKBASE_EMAIL")
+    password = os.getenv("KICKBASE_PASSWORD")
+    league_id = os.getenv("KICKBASE_LEAGUE_ID")
+
+    dry_run = getenv_bool("KICKBASE_DRY_RUN", False)
+
+    if not email or not password or not league_id:
+        raise RuntimeError(
+            "Bitte Umgebungsvariablen KICKBASE_EMAIL, KICKBASE_PASSWORD "
+            "und KICKBASE_LEAGUE_ID setzen."
+        )
+
+    logging.info("Starte Kickbase-Bot (DRY_RUN=%s)...", dry_run)
 
     with requests.Session() as session:
         # Login
-        login_v4(session, EMAIL, PASSWORD)
+        login_v4(session, email, password)
 
-        # Liga-Infos
-        league_me = get_league_me(session, LEAGUE_ID)
-        budget = int(league_me.get("b", 0))
-        log.info("Budget (aus JSON 'b'): %s", budget)
-        log.info("Budget: %s", budget)
+        # Budget / League-Me
+        league_me = get_league_me(session, league_id)
+        budget_raw = league_me.get("b", 0)
+        try:
+            budget = int(budget_raw)
+        except Exception:
+            budget = int(float(budget_raw) or 0)
 
-        # Markt
-        market_data = get_market(session, LEAGUE_ID)
+        logging.info("Budget (aus JSON 'b'): %d", budget)
 
-        # Kandidaten wählen
-        candidates = select_candidates(market_data, budget, max_players=5)
-
-        if not candidates:
-            log.info("Keine passenden Kandidaten gefunden.")
-        else:
-            for cand in candidates:
-                send_offer(
-                    session=session,
-                    league_id=LEAGUE_ID,
-                    player_id=cand["player_id"],
-                    player_name=cand["name"],
-                    bid_price=cand["bid_price"],
-                )
-
-        log.info("Bot-Durchlauf fertig.")
+        # Markt abarbeiten
+        process_market(session, league_id, budget, dry_run)
 
 
 if __name__ == "__main__":
