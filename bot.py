@@ -125,6 +125,7 @@ class Kickbase(KickbaseBase):
     def league_me(self, league) -> LeagueMe:
         """
         v4-Variante von league_me: GET /v4/leagues/{leagueId}/me
+        + Debug-Logs, damit wir sehen, wie das JSON heute aussieht.
         """
         league_id = self._get_league_id(league)
         logging.info("Hole league_me für Liga %s ...", league_id)
@@ -144,9 +145,17 @@ class Kickbase(KickbaseBase):
             raise KickbaseException()
 
         logging.info("league_me Status: %s", status)
+        logging.info("league_me raw JSON: %s", j)
 
         if status == 200:
-            return LeagueMe(j)
+            me_obj = LeagueMe(j)
+            logging.info(
+                "Parsed LeagueMe: budget=%s | team_value=%s | attrs=%s",
+                getattr(me_obj, "budget", None),
+                getattr(me_obj, "team_value", None),
+                me_obj.__dict__,
+            )
+            return me_obj
         else:
             logging.error(
                 "league_me fehlgeschlagen. Status=%s, body=%s",
@@ -158,6 +167,7 @@ class Kickbase(KickbaseBase):
     def market(self, league) -> Market:
         """
         v4-Variante vom Transfermarkt: GET /v4/leagues/{leagueId}/market
+        + Debug-Logs, damit wir sehen, was die API wirklich liefert.
         """
         league_id = self._get_league_id(league)
         logging.info("Hole market für Liga %s ...", league_id)
@@ -177,9 +187,24 @@ class Kickbase(KickbaseBase):
             raise KickbaseException()
 
         logging.info("market Status: %s", status)
+        logging.info("market raw JSON: %s", j)
 
         if status == 200:
-            return Market(j)
+            m = Market(j)
+            players = getattr(m, "players", []) or []
+            logging.info(
+                "Parsed Market: closed=%s | players_count=%d",
+                getattr(m, "closed", None),
+                len(players),
+            )
+            # zur Sicherheit ersten Spieler einmal loggen
+            if players:
+                p0 = players[0]
+                logging.info(
+                    "Erster Market-Player: %s",
+                    getattr(p0, "__dict__", p0),
+                )
+            return m
         else:
             logging.error(
                 "market fehlgeschlagen. Status=%s, body=%s",
