@@ -1,331 +1,201 @@
-import os
+#!/usr/bin/env python3
+"""
+Einfacher Kickbase-Login-Bot nur zum Debuggen des 401-Problems in GitHub Actions.
+
+Funktion:
+- lädt ENV-Variablen (KICKBASE_EMAIL, KICKBASE_PASSWORD, KICKBASE_LEAGUE_ID)
+- macht einen Login-Request gegen /v4/user/login
+- loggt Statuscode + Response-Body
+- loggt sicher, ob Email/Passwort überhaupt gesetzt sind (Längen, aber nicht Inhalt)
+
+Wenn das hier in GitHub Actions weiterhin 401 {"err":"AccessDenied"} liefert,
+dann ist das Problem sehr wahrscheinlich NICHT:
+- falscher Endpoint
+- JSON vs. Form-Daten
+- Code im restlichen Bot
+
+sondern eher:
+- Kickbase akzeptiert das Login von dieser Umgebung/IP nicht
+- Account hat Spezial-Login (z.B. Social Login, 2FA o.ä.)
+- Kickbase hat Anti-Bot / Captcha / Rate Limiting o.ä.
+
+Du startest das Script wie gehabt:
+    python bot.py
+"""
+
+import json
 import logging
-from datetime import datetime, timezone
+import os
+from typing import Tuple, Optional
+
 import requests
+from dotenv import load_dotenv
 
-# -------------------------------------------------------
-# Konfiguration
-# -------------------------------------------------------
-
-DRY_RUN = False  # auf True setzen, wenn du erstmal nur testen willst
-
-BASE_URL = "https://api.kickbase.com"
-LOGIN_URL_V4 = f"{BASE_URL}/v4/user/login"
-
-# Wie weit in die Zukunft darf ein Spieler noch auf dem Markt sein (in Minuten),
-# damit wir ein Gebot abgeben?
-MAX_MINUTES_LEFT = 24 * 60  # 24 Stunden
-
-# Minimaler Marktwert, damit der Spieler überhaupt interessant ist
-MIN_MARKET_VALUE = 500_000
-
-# Trend: 1 = steigt, 2 = stark steigt (laut deinen Logs)
-ALLOWED_TREND_FLAGS = {1, 2}
-
-# -------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Logging Setup
-# -------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# -------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Konfiguration
+# ---------------------------------------------------------------------------
+
+BASE_URL = "https://api.kickbase.com"
+LOGIN_PATH_V4 = "/v4/user/login"
+
+# Wenn du hier einen realistischeren User-Agent einsetzen willst, kannst du das tun.
+# Wichtig ist nur: in Actions und lokal dasselbe Verhalten.
+DEFAULT_HEADERS = {
+    "User-Agent": "Kickbase-Bot/0.1 (+github-actions)",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+}
+
+
+# ---------------------------------------------------------------------------
 # Hilfsfunktionen
-# -------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-def get_env_var(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Umgebungsvariable {name} ist nicht gesetzt!")
-    return value
-
-
-def parse_kickbase_datetime(dt_str: str) -> datetime:
+def load_env() -> Tuple[str, str, Optional[str]]:
     """
-    Kickbase gibt Datumswerte im Format '2025-12-08T20:59:23Z' zurück.
+    Lädt KICKBASE_EMAIL, KICKBASE_PASSWORD, KICKBASE_LEAGUE_ID aus Umgebung
+    (lokal zusätzlich aus .env via python-dotenv).
     """
-    return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    # .env nur lokal relevant – in GitHub Actions kommen die Werte aus secrets
+    load_dotenv()
 
+    email = os.getenv("KICKBASE_EMAIL")
+    password = os.getenv("KICKBASE_PASSWORD")
+    league_id = os.getenv("KICKBASE_LEAGUE_ID")
 
-# -------------------------------------------------------
-# Login
-# -------------------------------------------------------
+    # Niemals die Klarwerte loggen – nur Längen etc.
+    logger.info(
+        "ENV-Check: email_set=%s, password_set=%s, league_id_set=%s",
+        bool(email),
+        bool(password),
+        bool(league_id),
+    )
+
+    if email:
+        logger.info("KICKBASE_EMAIL length: %d", len(email))
+    else:
+        logger.error("KICKBASE_EMAIL ist NICHT gesetzt!")
+
+    if password:
+        logger.info("KICKBASE_PASSWORD length: %d", len(password))
+    else:
+        logger.error("KICKBASE_PASSWORD ist NICHT gesetzt!")
+
+    if not email or not password:
+        raise SystemExit(
+            "Fehlende ENV-Variablen: KICKBASE_EMAIL und/oder KICKBASE_PASSWORD "
+            "sind nicht gesetzt."
+        )
+
+    return email, password, league_id
+
 
 def login_v4(session: requests.Session, email: str, password: str) -> dict:
     """
-    Login über den funktionierenden v4-Endpoint.
-    Nutzt JSON-Body mit 'email' und 'password'.
+    Führt den Login gegen /v4/user/login durch und loggt alles Wichtige.
+
+    Bei Fehler -> RuntimeError mit vollem Response-Text.
     """
-    logging.info("Versuche Kickbase Login über /v4/user/login ...")
+    url = BASE_URL + LOGIN_PATH_V4
 
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        # ein halbwegs normaler User-Agent, nichts Exotisches
-        "User-Agent": "KickbaseBot/1.0 (Python requests)",
-    }
-
+    # Payload wie im offiziellen Login: JSON mit email/password
     payload = {
         "email": email,
         "password": password,
     }
 
-    r = session.post(LOGIN_URL_V4, headers=headers, json=payload)
-    logging.info("Login-HTTP-Status: %s", r.status_code)
-
-    if r.status_code != 200:
-        # Body mitloggen, um zu sehen, was Kickbase sagt (AccessDenied etc.)
-        logging.error("Login fehlgeschlagen: Status %s, Body=%s", r.status_code, r.text)
-        raise RuntimeError(f"Login fehlgeschlagen (Status {r.status_code}): {r.text}")
-
-    data = r.json()
-    username = data.get("un") or data.get("username") or "<unbekannt>"
-    logging.info("Login erfolgreich. Eingeloggt als: %s", username)
-
-    # Falls Kickbase ein Token oder ähnliches liefert, hier ins Session-Header setzen
-    token = data.get("tkn") or data.get("token")
-    if token:
-        session.headers.update({"X-Auth-Token": token})
-
-    return data
-
-
-# -------------------------------------------------------
-# Liga & Markt
-# -------------------------------------------------------
-
-def get_league_budget(session: requests.Session, league_id: str) -> float:
-    """
-    Holt Budget und league_me-Daten.
-    Wir nutzen den nicht-versionierten /leagues/{id}/me Endpoint,
-    der in deinen Logs 200 zurückgegeben hat.
-    """
-    url = f"{BASE_URL}/leagues/{league_id}/me"
-    logging.info("Hole league_me JSON für Liga %s ...", league_id)
-    r = session.get(url)
-    logging.info("league_me Status: %s", r.status_code)
-
-    if r.status_code != 200:
-        logging.error("league_me fehlgeschlagen: Status=%s, Body=%s", r.status_code, r.text)
-        raise RuntimeError(f"league_me fehlgeschlagen (Status {r.status_code})")
-
-    data = r.json()
-    logging.info("league_me raw JSON: %s", data)
-
-    budget = data.get("b")
-    if budget is None:
-        raise RuntimeError("Konnte Budget 'b' nicht aus league_me JSON lesen")
-    logging.info("Budget (aus JSON 'b'): %s", int(budget))
-    return float(budget)
-
-
-def get_market(session: requests.Session, league_id: str) -> dict:
-    """
-    Holt Markt-Daten der Liga.
-    In deinen Logs war das JSON-Feld 'it' die Liste der Spieler.
-    """
-    url = f"{BASE_URL}/leagues/{league_id}/market"
-    logging.info("Hole market JSON für Liga %s ...", league_id)
-    r = session.get(url)
-    logging.info("market Status: %s", r.status_code)
-
-    if r.status_code != 200:
-        logging.error("market fehlgeschlagen: Status=%s, Body=%s", r.status_code, r.text)
-        raise RuntimeError(f"market fehlgeschlagen (Status {r.status_code})")
-
-    data = r.json()
-    logging.info("market raw JSON: %s", data)
-
-    items = data.get("it", [])
-    logging.info("Spieler auf dem Markt (JSON 'it'): %d", len(items))
-
-    return data
-
-
-def select_candidates(market_json: dict) -> list[dict]:
-    """
-    Filtert interessante Spieler vom Markt anhand deiner Kriterien:
-    - MW >= MIN_MARKET_VALUE
-    - Trendflag in ALLOWED_TREND_FLAGS
-    - Restzeit <= MAX_MINUTES_LEFT
-    """
-    items = market_json.get("it", [])
-    mv_update_str = market_json.get("mvud")  # z.B. "2025-12-09T21:00:00Z" (nächste Marktwert-Update)
-    now_utc = datetime.now(timezone.utc)
-
-    candidates = []
-
-    for it in items:
-        player_id = it.get("i")
-        first_name = it.get("fn", "")
-        last_name = it.get("n", "")
-        name = (first_name + " " + last_name).strip() or f"ID {player_id}"
-        mv = it.get("mv", 0)
-        trend_flag = it.get("mvt", 0)
-        price = it.get("prc", mv)
-        dt_str = it.get("dt")  # Angebotsende? "2025-12-08T20:59:23Z"
-        prob = it.get("prob", 0)
-
-        # Grundfilter: MW & Trend
-        if mv < MIN_MARKET_VALUE:
-            continue
-        if trend_flag not in ALLOWED_TREND_FLAGS:
-            continue
-
-        # Restzeit berechnen, falls dt vorhanden ist
-        minutes_left = None
-        if dt_str:
-            try:
-                end_dt = parse_kickbase_datetime(dt_str)
-                minutes_left = int((end_dt - now_utc).total_seconds() // 60)
-            except Exception:
-                minutes_left = None
-
-        # Wenn wir eine Restzeit haben, filtere nach MAX_MINUTES_LEFT
-        if minutes_left is not None and minutes_left > MAX_MINUTES_LEFT:
-            continue
-
-        # kleines Overbid: 1–3 € über Marktwert, um nicht direkt überboten zu werden
-        bid_price = max(price, mv) + 3
-
-        candidates.append(
-            {
-                "player_id": player_id,
-                "name": name,
-                "mv": mv,
-                "trend_flag": trend_flag,
-                "prob": prob,
-                "minutes_left": minutes_left,
-                "bid_price": bid_price,
-            }
-        )
-
-    return candidates
-
-
-# -------------------------------------------------------
-# Gebot senden
-# -------------------------------------------------------
-
-def make_offer(session: requests.Session, league_id: str, player_id: str, price: int) -> None:
-    """
-    Sendet ein Gebot an Kickbase.
-    ACHTUNG: Endpunkt basiert auf typischem Kickbase-Schema.
-    Wenn Kickbase das anders erwartet, bekommen wir 404 und
-    sehen das im Log.
-    """
-    # Kandidat für Endpoint (es gibt keine Doku hier im Chat, wir stützen uns auf dein altes Muster)
-    url = f"{BASE_URL}/v4/user/league/{league_id}/market/{player_id}/offer"
-
-    payload = {
-        "prc": price,
-    }
-
-    logging.info(
-        "make_offer_v4: league_id=%s, player_id=%s, price=%s",
-        league_id,
-        player_id,
-        price,
+    logger.info("Versuche Kickbase Login über %s ...", url)
+    logger.info(
+        "Login-Payload: email_length=%d, password_length=%d",
+        len(email),
+        len(password),
     )
 
-    r = session.post(url, json=payload)
-    if r.status_code != 200:
-        logging.error(
-            "make_offer_v4 fehlgeschlagen: Status=%s, body=%s",
-            r.status_code,
-            r.text,
+    try:
+        response = session.post(
+            url,
+            headers=DEFAULT_HEADERS,
+            data=json.dumps(payload),
+            timeout=20,
         )
-        raise RuntimeError(f"make_offer_v4 failed with status {r.status_code}")
+    except Exception as exc:
+        logger.exception("HTTP-Request zu %s ist fehlgeschlagen: %s", url, exc)
+        raise
+
+    logger.info("Login-HTTP-Status: %s", response.status_code)
+
+    text_preview = response.text[:500] if response.text else ""
+    logger.info("Login-Response-Body (erste 500 Zeichen): %s", text_preview)
+
+    if response.status_code != 200:
+        logger.error(
+            "Login fehlgeschlagen: Status %s, Body=%s",
+            response.status_code,
+            response.text,
+        )
+        raise RuntimeError(
+            f"Login fehlgeschlagen (Status {response.status_code}): {response.text}"
+        )
+
+    try:
+        data = response.json()
+    except json.JSONDecodeError:
+        logger.error("Login-Response ist kein gültiges JSON!")
+        raise RuntimeError(f"Unerwarteter Login-Response: {response.text!r}")
+
+    # Username/Token o.ä. ausgeben, falls vorhanden
+    username = data.get("un") or data.get("username") or "<unbekannt>"
+    logger.info("Login erfolgreich. Eingeloggt als: %s", username)
+
+    token = data.get("t") or data.get("token")
+    if token:
+        session.headers["Authorization"] = f"Bearer {token}"
+        logger.info("Auth-Token im Session-Header gesetzt.")
     else:
-        logging.info("Gebot erfolgreich gesendet (Status %s)", r.status_code)
+        logger.warning("Kein Token im Login-Response gefunden – Folge-Requests könnten scheitern.")
+
+    return data
 
 
-# -------------------------------------------------------
-# Hauptlogik
-# -------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-def main():
-    email = get_env_var("KICKBASE_EMAIL")
-    password = get_env_var("KICKBASE_PASSWORD")
-    league_id = get_env_var("KICKBASE_LEAGUE_ID")
+def main() -> None:
+    logger.info("Starte Kickbase-Bot (Login-Debug-Variante, DRY_RUN nur Login)...")
 
-    logging.info("Starte Kickbase-Bot (DRY_RUN=%s)...", DRY_RUN)
+    email, password, league_id = load_env()
+
+    # League-ID ist für den Login egal, aber wir loggen sie, um zu sehen,
+    # ob sie aus ENV kommt:
+    logger.info("KICKBASE_LEAGUE_ID (nur debug): %s", league_id)
 
     with requests.Session() as session:
-        # Login
+        # Optional: Basis-Header für alle Requests
+        session.headers.update(DEFAULT_HEADERS)
+
         login_data = login_v4(session, email, password)
 
-        # Optional: Falls du später wieder über login_data die Ligen auslesen willst:
-        # logging.info("Login-Response: %s", login_data)
+        # Zur Sicherheit einmal das (gekürzte) Login-JSON loggen:
+        try:
+            pretty = json.dumps(login_data, indent=2, ensure_ascii=False)
+        except TypeError:
+            pretty = str(login_data)
+        logger.info("Login-JSON (gekürzt):\n%s", pretty[:1000])
 
-        # Budget holen
-        budget = get_league_budget(session, league_id)
-        logging.info("Budget: %s", int(budget))
-
-        # Markt holen
-        market_json = get_market(session, league_id)
-
-        # Kandidaten auswählen
-        candidates = select_candidates(market_json)
-        if not candidates:
-            logging.info("Keine passenden Kandidaten gefunden.")
-            return
-
-        logging.info("Gefundene Kandidaten: %d", len(candidates))
-
-        for c in candidates:
-            name = c["name"]
-            mv = c["mv"]
-            trend_flag = c["trend_flag"]
-            minutes_left = c["minutes_left"]
-            bid_price = int(c["bid_price"])
-            player_id = c["player_id"]
-
-            rest_text = (
-                f"{minutes_left} min"
-                if minutes_left is not None
-                else "unbekannt"
-            )
-
-            logging.info(
-                "Kandidat: %s | MW=%s | TrendFlag=%s | Rest=%s | Gebot=%s",
-                name,
-                mv,
-                trend_flag,
-                rest_text,
-                bid_price,
-            )
-
-            if DRY_RUN:
-                logging.info(
-                    "[DRY_RUN] Würde Gebot %s für %s (player_id=%s, Liga=%s) senden...",
-                    bid_price,
-                    name,
-                    player_id,
-                    league_id,
-                )
-                continue
-
-            try:
-                logging.info(
-                    "Sende Gebot %s für %s (player_id=%s, Liga=%s)...",
-                    bid_price,
-                    name,
-                    player_id,
-                    league_id,
-                )
-                make_offer(session, league_id, player_id, bid_price)
-            except Exception as e:
-                logging.error(
-                    "make_offer fehlgeschlagen für %s (player_id=%s): %s",
-                    name,
-                    player_id,
-                    e,
-                )
-
-        logging.info("Bot-Durchlauf fertig.")
+    logger.info("Bot-Durchlauf (Login-Debug) fertig.")
 
 
 if __name__ == "__main__":
